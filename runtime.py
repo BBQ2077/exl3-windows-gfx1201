@@ -102,7 +102,8 @@ try:
     import hip_utils
     gpu = torch.cuda.get_device_properties(0)
     if gpu.gcnArchName.split(':')[0] != 'gfx1201':
-        raise RuntimeError('This runtime targets gfx1201; detected ' + gpu.gcnArchName)
+        print('WARNING: kernels were precompiled for gfx1201; detected ' + gpu.gcnArchName
+              + ' - continuing, errors will come from the actual load', flush=True)
     print('PRECOMPILED_RUNTIME', gpu.name, torch.__version__, flush=True)
     args = sys.argv[1:]
     command = args.pop(0) if args else 'chat'

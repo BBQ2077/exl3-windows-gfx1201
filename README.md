@@ -9,14 +9,14 @@
 
 ## 適用顯卡
 
-這份 runtime **只支援 `gfx1201` 架構**，啟動時會檢查，其他架構會直接停止：
+ExLlamaV3 的 HIP 核心是針對 `gfx1201` 預先編譯的。啟動時偵測到其他架構只會印出 `WARNING`，照常往下跑，能不能用以實際載入結果為準：
 
-| 顯卡 | 架構 | 可用 |
+| 顯卡 | 架構 | 狀態 |
 |---|---|---|
 | Radeon RX 9070 XT／RX 9070／RX 9070 GRE | gfx1201 | ✅（實測：RX 9070 16 GB） |
 | Radeon AI PRO R9700（32 GB） | gfx1201 | ✅ |
-| Radeon RX 9060 XT／RX 9060 | gfx1200 | ❌ 需要另一份 gfx1200 版 |
-| RX 7000 系列（gfx110x）、NVIDIA | — | ❌ |
+| Radeon RX 9060 XT／RX 9060 | gfx1200 | 未測試 |
+| RX 7000 系列（gfx110x） | gfx110x | 未測試 |
 
 同為 gfx1201 的不同品牌板卡（華碩、技嘉、撼訊…）都能用，不需要重新編譯。
 
@@ -170,7 +170,7 @@ Qwen3.8-27B 自帶視覺塔。`--vision`（GGUFRun 的「視覺」選項）三�
 
 ## 常見問題
 
-- **`This runtime targets gfx1201; detected ...`**：顯卡不是 gfx1201，這份 runtime 不能用。
+- **`WARNING: kernels were precompiled for gfx1201; detected ...`**：顯卡不是 gfx1201，runtime 照常啟動；若後面出現 `invalid device function` 或 `no kernel image` 一類錯誤，代表核心不相容，需要針對該架構重新編譯。
 - **`verify.cmd` 檔案驗證失敗**：A、B 包版本不搭或解壓不完整，重新下載對應版本。
 - **防毒軟體攔截**：`python.exe`、`.pyd`、ROCm DLL 都是官方套件原檔，可將資料夾加入例外。
 - **路徑有空白**：可以，已測試搬到含空白的路徑仍正常。
