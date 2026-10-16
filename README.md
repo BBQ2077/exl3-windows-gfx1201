@@ -113,6 +113,14 @@ server.cmd -m "D:\Models\Qwen3.8-27B-EXL3-SC3.0bpw-H4-V4" -dm "D:\Models\Qwen3.8
 
 日誌出現 `EXL3_SERVER_READY` 後，瀏覽器開 `http://127.0.0.1:18437/` 就是聊天網頁；OpenAI 相容 API 在 `http://127.0.0.1:18437/v1/chat/completions`。伺服器只監聽本機 `127.0.0.1`。
 
+每次請求期間，日誌每 3 秒印一行進度（比照 llama-server），結束時印總結：
+
+```
+[EXL3] 預填 1000/2000 tok（50%）｜3.2 s｜312.2 tok/s
+[EXL3] 生成 44 tok｜平均 14.5 tok/s｜近 3 秒 14.2 tok/s｜草稿接受 30/40（75%）
+[EXL3] 完成：預填 2000 tok／6.48 s（308.8 tok/s）｜快取重用 0 tok｜生成 120 tok／8.38 s（14.3 tok/s）
+```
+
 常用參數：
 
 | 參數 | 說明 |

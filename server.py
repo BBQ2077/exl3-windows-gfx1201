@@ -471,6 +471,39 @@ class LiveTimings:
                 'time_ms': (time.time() - first) * 1000 if first else 0}
 
 
+class ProgressLog:
+    """生成途中每隔幾秒印一行進度，比照 llama-server 的 prompt processing／n_gen、tg、tg_3s。"""
+    def __init__(self, live, interval=3.0, clock=time.time):
+        self.live, self.interval, self.clock = live, interval, clock
+        self.last, self.mark = clock(), None
+
+    def prefill(self, result):
+        now = self.clock()
+        if now - self.last < self.interval:
+            return
+        self.last = now
+        p = self.live.progress(result)
+        done, todo, sec = max(0, p['processed'] - p['cache']), max(0, p['total'] - p['cache']), p['time_ms'] / 1000
+        log(f'[EXL3] 預填 {done}/{todo} tok' + (f'（{done / todo:.0%}）' if todo else '') + f'｜{sec:.1f} s'
+            + (f'｜{done / sec:.1f} tok/s' if sec else ''))
+
+    def generate(self):
+        now, t = self.clock(), self.live.timings()
+        n = t['predicted_n']
+        if self.mark is None:                    # 第一個 token：開始計時，3 秒後才印
+            self.mark, self.last = (now, n), now
+            return
+        if now - self.last < self.interval:
+            return
+        recent = (n - self.mark[1]) / (now - self.mark[0]) if now > self.mark[0] else 0
+        out = [f'[EXL3] 生成 {n} tok', f"平均 {t['predicted_per_second']:.1f} tok/s",
+               f'近 {now - self.mark[0]:.0f} 秒 {recent:.1f} tok/s']
+        if t.get('draft_n'):
+            out.append(f"草稿接受 {t['draft_n_accepted']}/{t['draft_n']}（{t['draft_n_accepted'] / t['draft_n']:.0%}）")
+        log('｜'.join(out))
+        self.mark, self.last = (now, n), now
+
+
 def response_budget(prompt, context, requested, draft):
     if requested is None or requested == -1:          # -1：llama.cpp 的「不限」，同 0
         requested = 0
@@ -824,6 +857,7 @@ class Handler(BaseHTTPRequestHandler):
                 engine.cancelled.clear()
                 created = int(time.time())
                 live = LiveTimings(job, prompt_count, getattr(engine, 'page_size', 256))
+                progress_log = ProgressLog(live)
                 want_progress = bool(body.get('return_progress'))
                 clock = {'write': time.perf_counter(), 'timings': 0.0}
                 def event(delta, finish=None, usage=None, metrics=None, timings=None, progress=None):
@@ -891,10 +925,13 @@ class Handler(BaseHTTPRequestHandler):
                         clock['write'] = time.perf_counter()
                     for result in engine.generator.iterate():
                         stage = result.get('stage')
-                        if stage == 'prefill' and streaming and want_progress:
-                            event({}, progress=live.progress(result))
+                        if stage == 'prefill':
+                            progress_log.prefill(result)
+                            if streaming and want_progress:
+                                event({}, progress=live.progress(result))
                         if stage == 'streaming':
                             emit(parsed.feed(result.get('text', '')))
+                            progress_log.generate()
                         if result.get('eos'):
                             terminal = result
                 emit(parsed.feed('', final=True), final=True)
