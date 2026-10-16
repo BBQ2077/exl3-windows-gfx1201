@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GGUFRun · EXL3 聊天</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#10151e;color:#e5edf7}body{margin:auto;max-width:1100px;padding:24px}header{display:flex;align-items:center;gap:18px}h1{font-size:24px}small,#status,#metrics{color:#9db1c9}button,input,textarea,select{font:inherit;color:inherit;background:#1b2636;border:1px solid #394b64;border-radius:8px;padding:9px}button{cursor:pointer}button:disabled{opacity:.4;cursor:default}textarea{box-sizing:border-box;width:100%;resize:vertical}#messages{min-height:35vh;margin:22px 0}.message{padding:16px 20px;border-radius:12px;background:#182231;margin:12px 0;overflow-wrap:anywhere;white-space:pre-wrap}.user{background:#20354a}.role{font-weight:bold;color:#70b9ff;margin-bottom:8px}details{margin:12px 0}details pre{white-space:pre-wrap;color:#a5b6cc;font:inherit}summary{cursor:pointer}.settings{display:flex;flex-wrap:wrap;gap:14px;padding:12px}.settings input[type=number]{width:75px}.toolbar{display:flex;gap:12px;align-items:center;margin-top:12px}#error{color:#ffb6ae;white-space:pre-wrap}#metrics{font-size:14px;margin:12px 0}
+</style>
+<header><h1>GGUFRun · EXL3</h1><span id="status">正在連接…</span></header>
+<small id="model"></small>
+<details><summary>聊天設定</summary><div class="settings">
+<label><input type="checkbox" id="think" checked>思考</label>
+<label>思考強度 <select id="effort"><option value="">模型預設</option><option value="xhigh">xhigh</option><option value="medium">medium</option><option value="low">low</option></select></label>
+<label>Temperature <input type="number" id="temp" value="0.8" min="0" step="0.1"></label>
+<label>Top-P <input type="number" id="topp" value="0.95" min="0.01" max="1" step="0.01"></label>
+<label>Top-K <input type="number" id="topk" value="20" min="0" step="1"></label>
+<label>Min-P <input type="number" id="minp" value="0" min="0" max="1" step="0.01"></label>
+<label>最大輸出 <input type="number" id="maxr" value="0" min="0" step="1"> <small>0＝剩餘上下文，包含思考</small></label>
+</div><label>系統提示詞<textarea id="system" rows="2" placeholder="留空使用模型預設"></textarea></label></details>
+<div id="messages" aria-live="polite"></div>
+<div id="error" role="alert"></div><div id="metrics"></div>
+<form id="chat"><textarea id="prompt" rows="4" placeholder="輸入訊息；Ctrl＋Enter 送出"></textarea>
+<div class="toolbar"><button id="send" disabled>送出</button><button type="button" id="stop" disabled>停止生成</button><button type="button" id="clear">清空對話</button></div></form>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);let history=[],controller=null,requestId=null,ready=false,initialized=false;
+function bubble(role){const box=document.createElement('div');box.className='message '+role;const label=document.createElement('div');label.className='role';label.textContent=role==='user'?'你':'模型';box.append(label);const reasoning=document.createElement('details');const summary=document.createElement('summary');summary.textContent='思考過程';const pre=document.createElement('pre');reasoning.append(summary,pre);reasoning.hidden=true;box.append(reasoning);const answer=document.createElement('div');box.append(answer);$('messages').append(box);return{box,answer,pre,reasoning};}
+async function health(){try{const p=await(await fetch('/props',{cache:'no-store'})).json();ready=p.status==='ok';$('status').textContent=p.status==='error'?'模型載入失敗':ready?'已就緒 · '+p.default_generation_settings.n_ctx+' tokens':'模型載入中…';$('model').textContent=p.alias+(p.draft_model?' · DFlash2':' · 主模型解碼');if(p.error)$('error').textContent=p.error;if(!initialized){$('think').checked=p.thinking;initialized=true;}$('send').disabled=!ready||!!controller;}catch(e){ready=false;$('status').textContent='服務未連接';$('send').disabled=true;}}
+async function cancel(){if(requestId){try{await fetch('/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id:requestId})});}catch(e){}}if(controller)controller.abort();}
+$('stop').onclick=cancel;
+$('clear').onclick=async()=>{await cancel();history=[];$('messages').replaceChildren();$('metrics').textContent='';$('error').textContent='';};
+$('prompt').onkeydown=e=>{if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();$('chat').requestSubmit();}};
+$('chat').onsubmit=async e=>{e.preventDefault();if(controller||!ready)return;const text=$('prompt').value.trim();if(!text)return;$('error').textContent='';$('metrics').textContent='';const u=bubble('user');u.answer.textContent=text;const a=bubble('assistant');const initialHistory=history;history.push({role:'user',content:text});$('prompt').value='';controller=new AbortController();requestId=null;$('stop').disabled=false;$('send').disabled=true;let content='',reasoning='',done=false;const messages=[...history];if($('system').value.trim())messages.unshift({role:'system',content:$('system').value});
+try{const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({messages,stream:true,temperature:Number($('temp').value),top_p:Number($('topp').value),top_k:Number($('topk').value),min_p:Number($('minp').value),max_tokens:Number($('maxr').value),enable_thinking:$('think').checked,...($('effort').value?{reasoning_effort:$('effort').value}:{})})});if(!response.ok){const data=await response.json();throw Error(data.error?.message||'HTTP '+response.status);}const reader=response.body.getReader(),decoder=new TextDecoder();let pending='';while(true){const part=await reader.read();if(part.done)break;pending+=decoder.decode(part.value,{stream:true});let cut;while((cut=pending.indexOf('\n\n'))>=0){const frame=pending.slice(0,cut);pending=pending.slice(cut+2);for(const line of frame.split('\n')){if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]'){done=true;continue;}const data=JSON.parse(raw);if(data.error)throw Error(data.error.message);requestId=data.id||requestId;const delta=data.choices?.[0]?.delta||{};content+=delta.content||'';reasoning+=delta.reasoning_content||'';a.answer.textContent=content;a.pre.textContent=reasoning;a.reasoning.hidden=!reasoning;if(data.usage){const speed=data.exl3?.generate_tps;$('metrics').textContent='輸入 '+data.usage.prompt_tokens+' · 輸出 '+data.usage.completion_tokens+(speed?' · '+speed.toFixed(2)+' tok/s':'')+(data.exl3?.cancelled?' · 已停止':'');}}}a.box.scrollIntoView({block:'nearest'});}if(!done)throw Error('連線已結束，可保留目前回答或重新送出');}
+catch(error){if(error.name!=='AbortError')$('error').textContent=error.message;else $('metrics').textContent='已停止生成';}
+finally{if(history===initialHistory){if(content)history.push({role:'assistant',content});else history.pop();}controller=null;requestId=null;$('stop').disabled=true;$('send').disabled=!ready;}};
+health();setInterval(health,2000);
+</script></html>

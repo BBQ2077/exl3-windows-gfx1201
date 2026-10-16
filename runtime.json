@@ -1,0 +1,6 @@
+{
+  "backend": "exllamav3",
+  "format": "exl3",
+  "gpu_arch": "gfx1201",
+  "entrypoint": "server.py"
+}

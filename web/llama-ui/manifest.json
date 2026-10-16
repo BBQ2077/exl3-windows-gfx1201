@@ -1,0 +1,355 @@
+{
+ "source": "llama-server b11642 (llama-server-impl.dll)",
+ "files": {
+  "/": {
+   "file": "index.html.gz",
+   "type": "text/html; charset=utf-8",
+   "gzip": true
+  },
+  "/pwa-64x64.png": {
+   "file": "pwa-64x64.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/pwa-512x512.png": {
+   "file": "pwa-512x512.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/pwa-192x192.png": {
+   "file": "pwa-192x192.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/maskable-icon-512x512.png": {
+   "file": "maskable-icon-512x512.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/favicon.svg": {
+   "file": "favicon.svg.gz",
+   "type": "image/svg+xml",
+   "gzip": true
+  },
+  "/favicon.ico": {
+   "file": "favicon.ico.gz",
+   "type": "image/x-icon",
+   "gzip": true
+  },
+  "/favicon-dark.svg": {
+   "file": "favicon-dark.svg.gz",
+   "type": "image/svg+xml",
+   "gzip": true
+  },
+  "/favicon-dark.ico": {
+   "file": "favicon-dark.ico.gz",
+   "type": "image/x-icon",
+   "gzip": true
+  },
+  "/apple-touch-icon-180x180.png": {
+   "file": "apple-touch-icon-180x180.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-750x1334.png": {
+   "file": "apple-splash-portrait-dark-750x1334.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-640x1136.png": {
+   "file": "apple-splash-portrait-dark-640x1136.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-2048x2732.png": {
+   "file": "apple-splash-portrait-dark-2048x2732.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1668x2388.png": {
+   "file": "apple-splash-portrait-dark-1668x2388.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1640x2360.png": {
+   "file": "apple-splash-portrait-dark-1640x2360.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1488x2266.png": {
+   "file": "apple-splash-portrait-dark-1488x2266.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1320x2868.png": {
+   "file": "apple-splash-portrait-dark-1320x2868.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1290x2796.png": {
+   "file": "apple-splash-portrait-dark-1290x2796.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1284x2778.png": {
+   "file": "apple-splash-portrait-dark-1284x2778.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1206x2622.png": {
+   "file": "apple-splash-portrait-dark-1206x2622.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1179x2556.png": {
+   "file": "apple-splash-portrait-dark-1179x2556.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-dark-1170x2532.png": {
+   "file": "apple-splash-portrait-dark-1170x2532.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-750x1334.png": {
+   "file": "apple-splash-portrait-750x1334.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-640x1136.png": {
+   "file": "apple-splash-portrait-640x1136.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-2048x2732.png": {
+   "file": "apple-splash-portrait-2048x2732.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1668x2388.png": {
+   "file": "apple-splash-portrait-1668x2388.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1640x2360.png": {
+   "file": "apple-splash-portrait-1640x2360.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1488x2266.png": {
+   "file": "apple-splash-portrait-1488x2266.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1320x2868.png": {
+   "file": "apple-splash-portrait-1320x2868.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1290x2796.png": {
+   "file": "apple-splash-portrait-1290x2796.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1284x2778.png": {
+   "file": "apple-splash-portrait-1284x2778.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1206x2622.png": {
+   "file": "apple-splash-portrait-1206x2622.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1179x2556.png": {
+   "file": "apple-splash-portrait-1179x2556.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-portrait-1170x2532.png": {
+   "file": "apple-splash-portrait-1170x2532.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2868x1320.png": {
+   "file": "apple-splash-landscape-dark-2868x1320.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2796x1290.png": {
+   "file": "apple-splash-landscape-dark-2796x1290.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2778x1284.png": {
+   "file": "apple-splash-landscape-dark-2778x1284.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2732x2048.png": {
+   "file": "apple-splash-landscape-dark-2732x2048.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2622x1206.png": {
+   "file": "apple-splash-landscape-dark-2622x1206.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2556x1179.png": {
+   "file": "apple-splash-landscape-dark-2556x1179.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2532x1170.png": {
+   "file": "apple-splash-landscape-dark-2532x1170.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2388x1668.png": {
+   "file": "apple-splash-landscape-dark-2388x1668.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2360x1640.png": {
+   "file": "apple-splash-landscape-dark-2360x1640.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-2266x1488.png": {
+   "file": "apple-splash-landscape-dark-2266x1488.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-1334x750.png": {
+   "file": "apple-splash-landscape-dark-1334x750.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-dark-1136x640.png": {
+   "file": "apple-splash-landscape-dark-1136x640.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2868x1320.png": {
+   "file": "apple-splash-landscape-2868x1320.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2796x1290.png": {
+   "file": "apple-splash-landscape-2796x1290.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2778x1284.png": {
+   "file": "apple-splash-landscape-2778x1284.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2732x2048.png": {
+   "file": "apple-splash-landscape-2732x2048.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2622x1206.png": {
+   "file": "apple-splash-landscape-2622x1206.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2556x1179.png": {
+   "file": "apple-splash-landscape-2556x1179.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2532x1170.png": {
+   "file": "apple-splash-landscape-2532x1170.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2388x1668.png": {
+   "file": "apple-splash-landscape-2388x1668.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2360x1640.png": {
+   "file": "apple-splash-landscape-2360x1640.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-2266x1488.png": {
+   "file": "apple-splash-landscape-2266x1488.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-1334x750.png": {
+   "file": "apple-splash-landscape-1334x750.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/apple-splash-landscape-1136x640.png": {
+   "file": "apple-splash-landscape-1136x640.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/recommended-mcp/huggingface.ico": {
+   "file": "recommended-mcp/huggingface.ico.gz",
+   "type": "image/x-icon",
+   "gzip": true
+  },
+  "/recommended-mcp/github-light.png": {
+   "file": "recommended-mcp/github-light.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/recommended-mcp/github-dark.png": {
+   "file": "recommended-mcp/github-dark.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/recommended-mcp/exa.ico": {
+   "file": "recommended-mcp/exa.ico.gz",
+   "type": "image/x-icon",
+   "gzip": true
+  },
+  "/recommended-mcp/context7.png": {
+   "file": "recommended-mcp/context7.png.gz",
+   "type": "image/png",
+   "gzip": true
+  },
+  "/_app/version.json": {
+   "file": "_app/version.json.gz",
+   "type": "application/json",
+   "gzip": true
+  },
+  "/_app/immutable/bundle.Bkusd0vb.js": {
+   "file": "_app/immutable/bundle.Bkusd0vb.js.gz",
+   "type": "application/javascript",
+   "gzip": true
+  },
+  "/_app/immutable/assets/bundle.DmJS8kUp.css": {
+   "file": "_app/immutable/assets/bundle.DmJS8kUp.css.gz",
+   "type": "text/css",
+   "gzip": true
+  },
+  "/manifest.webmanifest": {
+   "file": "manifest.webmanifest.gz",
+   "type": "application/manifest+json",
+   "gzip": true
+  },
+  "/sw.js": {
+   "file": "sw.js.gz",
+   "type": "application/javascript",
+   "gzip": true
+  },
+  "/workbox-b3c04f83.js": {
+   "file": "workbox-b3c04f83.js.gz",
+   "type": "application/javascript",
+   "gzip": true
+  },
+  "/build.json": {
+   "file": "build.json.gz",
+   "type": "application/json",
+   "gzip": true
+  }
+ }
+}

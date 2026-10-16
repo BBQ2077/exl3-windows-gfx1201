@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-10-16T09:53:35.566405+08:00",
+  "target": "Windows x64 / AMD gfx1201",
+  "exllamav3_base_commit": "7b3e6898f381ae59a75db7e7608199ee48ae7e0c",
+  "python": "3.12.0",
+  "torch": "2.13.0+rocm10.1.0",
+  "triton_windows": "3.7.1.post27",
+  "model_weights": "External shared model folders selected through models.json",
+  "native_extensions": {
+    "exllamav3_ext.pyd": "dfa4ea999876706c591c147cd90e114a39eaff7debd1acae775a06ed64f83b2b",
+    "hip_utils.pyd": "88a529dc76e90a9876bd568bdd0df4185216eeb19ae67518f519ec5ac774adaf"
+  }
+}
