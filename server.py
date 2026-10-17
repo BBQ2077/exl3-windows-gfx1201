@@ -645,12 +645,100 @@ class AutoDraft:
                 self.probe[key] = (near[(self.count[key] // self.REPROBE) % len(near)], 3)
         return cur
 
-    def record(self, active, ndt, tokens, seconds):
+    def record(self, active, ndt, tokens, seconds, accepted=None):
         if tokens <= 0 or seconds <= 0:
             return
         rate = tokens / seconds
         old = self.stats.get((active, ndt))
         self.stats[(active, ndt)] = (rate, 1) if old is None else (old[0] + self.EMA * (rate - old[0]), old[1] + 1)
+
+
+class AcceptDraft:
+    """--auto-draft-accept：每輪依「最近各位置的草稿猜中率」與「各列數級距的每輪耗時」挑草稿數（0～-ndt）。
+    猜中率跟內容走，換題幾輪內就跟上；耗時只看路數與列數級距（路數 ×（草稿數＋1）補到 8／16／32／64 列），跟內容無關。
+    統計沿用驗證時本來就算出的每路接受數，只在 CPU 端做整數與少量浮點運算。"""
+    DECAY, PRIOR, WEIGHT, WARM, EMA, PROBE, MARGIN = 0.95, 0.6, 2.0, 3, 0.2, 40, 1.03
+
+    def __init__(self, generator, ceiling):
+        self.gen, self.ceiling = generator, ceiling
+        self.cands = list(range(ceiling + 1))
+        self.hit = [0.0] * (ceiling + 2)
+        self.tried = [0.0] * (ceiling + 2)
+        self.cost, self.cur, self.count, self.probe = {}, {}, {}, {}
+
+    @staticmethod
+    def tier(rows):
+        t = 8
+        while t < rows:
+            t *= 2
+        return t
+
+    def key(self, n, d):
+        return n, self.tier(n * (d + 1)), d > 0
+
+    def groups(self, n):
+        rep = {}
+        for d in self.cands:
+            rep[self.key(n, d)] = d
+        return rep
+
+    def rates(self):
+        q, prev = [], self.PRIOR
+        for p in range(1, self.ceiling + 1):
+            prev = (self.hit[p] + self.WEIGHT * prev) / (self.tried[p] + self.WEIGHT)
+            q.append(prev)
+        return q
+
+    def expect(self, q, d):
+        e, run = 1.0, 1.0
+        for p in range(d):
+            run *= q[p]
+            e += run
+        return e
+
+    def pick(self, active):
+        n = active
+        self.count[n] = self.count.get(n, 0) + 1
+        rep = self.groups(n)
+        for k in sorted(rep, key=lambda k: -rep[k]):
+            if self.cost.get(k, (0, 0))[1] < self.WARM:
+                return rep[k]
+        if self.probe.get(n) is not None:
+            d, self.probe[n] = self.probe[n], None
+            return d
+        q = self.rates()
+        score = {d: n * self.expect(q, d) / self.cost[self.key(n, d)][0] for d in self.cands}
+        best = max(self.cands, key=lambda d: score[d])
+        cur = self.cur.get(n)
+        if cur is None or score[best] > score[cur] * self.MARGIN:
+            if cur != best:
+                log(f'[EXL3] 自動草稿（猜中率）｜{n} 路 → ' + (f'草稿 {best} token' if best else '暫停草稿')
+                    + f'（各位置猜中率 {[round(v, 2) for v in q]}｜預估 tok/s {round(score[cur], 1) if cur is not None else "-"} → {round(score[best], 1)}）')
+            self.cur[n] = cur = best
+        if self.count[n] % self.PROBE == 0:
+            above = sorted({rep[k] for k in rep if rep[k] > cur})
+            if above:
+                self.probe[n] = above[0]
+        return cur
+
+    def record(self, active, ndt, tokens, seconds, accepted=None):
+        if seconds <= 0:
+            return
+        k = self.key(active, ndt)
+        old = self.cost.get(k)
+        self.cost[k] = (seconds, 1) if old is None else (old[0] + self.EMA * (seconds - old[0]), old[1] + 1)
+        if ndt < 1 or not accepted:
+            return
+        for p in range(1, self.ceiling + 1):
+            self.hit[p] *= self.DECAY
+            self.tried[p] *= self.DECAY
+        for a in accepted:
+            a = max(0, min(int(a), ndt))
+            for p in range(1, a + 1):
+                self.hit[p] += 1
+                self.tried[p] += 1
+            if a < ndt:
+                self.tried[a + 1] += 1
 
 
 class GenerationScheduler:
@@ -768,11 +856,13 @@ class GenerationScheduler:
                 jobs = list(gen.active_jobs)
                 ndt = gen.num_draft_tokens = auto.pick(len(jobs)) if jobs else auto.ceiling
                 before = sum(j.new_tokens for j in jobs)
+                acc0 = [getattr(j, 'accepted_draft_tokens', 0) for j in jobs]
                 t0 = time.perf_counter()
             results = gen.iterate()
             if auto is not None and jobs:
                 if not any(r.get('stage') == 'prefill' for r in results) and all(j in gen.active_jobs for j in jobs):
-                    auto.record(len(jobs), ndt, sum(j.new_tokens for j in jobs) - before, time.perf_counter() - t0)
+                    auto.record(len(jobs), ndt, sum(j.new_tokens for j in jobs) - before, time.perf_counter() - t0,
+                                [getattr(j, 'accepted_draft_tokens', 0) - a for j, a in zip(jobs, acc0)])
             for result in results:
                 if result.get('serial') in discarded:
                     continue
@@ -895,9 +985,10 @@ class Engine:
                     + (f"／SSD {self.args.disk_cache_dir}（上限 {self.args.disk_cache_size or 50:g} GB）" if self.args.cpu_cache_size and self.args.disk_cache_dir else '')
                     + (f"｜重複內容長草稿 {self.args.hybrid_draft_tokens}" if self.args.hybrid_draft_tokens else '')
                     + (f"｜n-gram 草稿 {self.args.ngram_match_min}" if self.args.ngram_match_min else ''))
-                if self.args.auto_draft and self.generator.num_draft_tokens >= 1 and self.generator.draft_model is not None:
-                    self.auto_draft = AutoDraft(self.generator, self.generator.num_draft_tokens)
-                    log(f'[EXL3] 自動草稿：開，檔位 {self.auto_draft.cands}')
+                if (self.args.auto_draft or self.args.auto_draft_accept) and self.generator.num_draft_tokens >= 1 and self.generator.draft_model is not None:
+                    kind = AcceptDraft if self.args.auto_draft_accept else AutoDraft
+                    self.auto_draft = kind(self.generator, self.generator.num_draft_tokens)
+                    log(f'[EXL3] 自動草稿：開（' + ('依各位置猜中率' if self.args.auto_draft_accept else '依實測速度') + f'），檔位 {self.auto_draft.cands}')
                 if self.generator.max_batch_size < self.parallel:
                     raise RuntimeError('引擎狀態槽數不足，無法提供指定的同時生成數')
                 self.load_vision()
@@ -1360,6 +1451,8 @@ def main():
                         help='同時生成數（1～8）；-cs 是每路 Context，總 KV 容量為 -cs × 路數')
     parser.add_argument('--auto-draft', action='store_true',
                         help='依實測速度自動調草稿數（0～-ndt，0＝暫停草稿；依同時生成路數分開量）；預設關')
+    parser.add_argument('--auto-draft-accept', action='store_true',
+                        help='依最近各位置的草稿猜中率與列數級距耗時，每輪自動調草稿數（0～-ndt）；換內容幾輪內跟上；預設關')
     parser.add_argument('--gemv-wmma', choices=['0', '1'], default=None,
                         help='多列快路徑（8～64 列 WMMA GEMV）；預設 1＝開')
     parser.add_argument('--gemv-max-m', choices=['32', '64'], default=None,
