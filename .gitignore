@@ -5,3 +5,8 @@
 /state/
 __pycache__/
 *.pyc
+/build/
+*.log
+*.prev
+*.bak*
+.pytest_cache/

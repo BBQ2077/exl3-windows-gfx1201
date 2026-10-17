@@ -305,6 +305,21 @@ class DFlash2Model(Model):
         lm = target.modules[target.logit_layer_idx]
         logits = lm.prepare_for_device(state.half(), params)
         logits = lm.forward(logits, params)
+
+        # Speculative sampling (the generator sets the job sampler's temperature): sampled walk plus its proposal
+        # distribution, verified by rejection sampling in the generator
+        spec_t = params.get("dflash2_temperature", 0.0)
+        if spec_t > 0.0:
+            out, q, cands = self.selector.walk_sample(
+                to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor, spec_t,
+                vocab_size = target.config.vocab_size,
+                scale = self.config.output_multiplier,
+                softcap = self.config.final_logit_softcapping,
+                generator = params.get("dflash2_generator"),
+            )
+            params["dflash2_q"] = q
+            params["dflash2_cands"] = cands
+            return out
         # [anchor, path...] and [0, score...] straight from the selector, in the block layout
         # the generator consumes. The head's padded width, the output multiplier and the
         # softcap (Gemma-class targets) are handled inside the selector's top-k. The state

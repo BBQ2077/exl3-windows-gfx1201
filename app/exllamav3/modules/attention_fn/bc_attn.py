@@ -307,7 +307,9 @@ class BCAttn:
         from .triton_paged import (
             combine_subtiles,
             decode_row_layout,
-            _paged_attn_decode_split_kernel,
+            decode_launch_overrides,
+            decode_split_target,
+            decode_split_kernel_for,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
             _normalize_window,
@@ -319,13 +321,19 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
+        # Per backend / architecture defaults (util/backend.py), each overridable by EXL3_DEC_* (shared with
+        # the eager launch, so a fallback keeps the tuning)
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
+        env_warps, env_stages, env_block_n = decode_launch_overrides()
+        block_n = env_block_n or block_n
+        split_warps = split_warps if env_warps is None else env_warps
+        split_stages = split_stages if env_stages is None else env_stages
         block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = 2 * _get_sm_count(dev)
+        target = decode_split_target(_get_sm_count(dev), q_len)
         splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
@@ -352,8 +360,16 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
-                                  pointer_range_32 = self._pointer_range_32())
+        split_fn = decode_split_kernel_for(self.k_bits if self.quant else 0, self.v_bits if self.quant else 0, hd, hd_pad)
+        try:
+            k_split = _compile_kernel(dev, split_fn, sig, consts, split_warps, split_stages,
+                                      pointer_range_32 = self._pointer_range_32())
+        except BCKernelTooLarge:
+            # Same fallback as the eager launch: a multi-stage pick that overflows at this row tile retries single-stage
+            if split_stages <= 1:
+                raise
+            k_split = _compile_kernel(dev, split_fn, sig, consts, split_warps, 1,
+                                      pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",

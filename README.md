@@ -6,6 +6,8 @@
 - ExLlamaV3 1.6.2 的 C++／HIP 擴充已針對 `gfx1201` 預先編譯（`native/exllamav3_ext.pyd`）。
 - `server.py`：OpenAI 相容 API 伺服器，附 llama.cpp 網頁介面，支援思考模式、工具呼叫、DFlash2 投機解碼、多輪前文快取、看圖。
 - 推薦搭配 **[GGUFRun](https://github.com/BBQ2077/GGUFRun)** 使用：在圖形介面選模型、調參數、一鍵啟動。
+- 可同時處理多個請求（`--parallel` 1～8，預設 2）：每一路有自己的串流、可各自取消，主模型與草稿各只載一份。
+- 加速與快取：RDNA4 多列 GEMV 快路徑（一次 8～64 列）、DFlash2 拒絕取樣、前文快取可放系統 RAM 與 SSD。
 
 ## 適用顯卡
 
@@ -25,6 +27,8 @@ ExLlamaV3 的 HIP 核心是針對 `gfx1201` 預先編譯的。啟動時偵測到
 - Windows 10／11 64 位元。
 - AMD Adrenalin 顯示卡驅動：使用近期版本（實測驅動 `32.0.32015.2008`）。runtime 只用系統裝好的驅動，其他 ROCm 元件都自帶。
 - 系統 RAM：建議 32 GB（多輪快取預設用 4 GB RAM；視覺塔放 RAM 時另外佔一點）。
+- 多路同時生成時，`-cs` 是**每一路**的 context，總 KV 容量＝路數 × `-cs`（例：8 路 × 8192 ＝ 131072 token）。
+  顯存不夠時先降 `-cs` 或路數；模型權重仍然只有一份。
 - 硬碟：runtime 解壓後約 2.5 GB；Qwen3.8-27B 3.0bpw 模型約 12 GB＋草稿 0.9 GB。
 
 ## 下載與安裝
@@ -136,6 +140,29 @@ server.cmd -m "D:\Models\Qwen3.8-27B-EXL3-SC3.0bpw-H4-V4" -dm "D:\Models\Qwen3.8
 | `--vision` | `off`／`gpu`／`ram`，見下節 |
 | `-temp -topp -topk -minp` | 預設取樣參數（請求可覆蓋） |
 
+### 多路同時生成與加速選項
+
+```bat
+server.cmd -m "D:\Models\Qwen3.8-27B-EXL3-SC3.0bpw-H4-V4" -dm "D:\Models\Qwen3.8-27B-DFlash2-EXL3-3.0bpw" ^
+  --parallel 2 -cs 65536 -cq 4 -rcs 4 --thinking on
+```
+
+| 參數 | 說明 |
+|---|---|
+| `--parallel N` | 同時生成的請求數，1～8，預設 2。每一個請求獨立串流、獨立取消；滿了再送會排隊。 |
+| `--auto-draft` | 依「目前同時幾路」分別實測草稿長度與速度，自動挑最快的一檔（0～`-ndt`；0＝暫停草稿）。要快 5% 以上才換，並定期重測。 |
+| `--gemv-wmma 0/1` | 多列 GEMV 快路徑，預設開。懷疑數值異常時關掉比對。 |
+| `--gemv-max-m 32/64` | 快路徑一次最多幾列，預設 64。改 32 時 33 列以上走較慢的舊路徑（greedy 逐字一致優先）。 |
+| `--dflash2-host-cb` | 實驗：DFlash2 的選擇查表放系統 RAM，省約 240 MB 顯存。 |
+| `--qc-staging-sliced` | 實驗：量化 KV 分段搬運，壓低長 Context 的顯存尖峰。 |
+| `-ccs GB` | 前文快取放系統 RAM（第二層）。同一段長提示詞再出現時不用重讀。 |
+| `-dcd 資料夾` | 前文快取放 SSD（第三層，需 `-ccs > 0`），server 重開後仍有效。 |
+| `-dcs GB` | SSD 快取上限，所有模型共用，預設 50 GB。 |
+| `-hdt N` | 輸出照抄前文時（改程式碼、複述文件），一次抄 N 個 token 當草稿驗證。留空／0＝關。 |
+| `-ngram N` | 不用草稿模型，改從前文找相同片段當草稿；只在沒載草稿模型時生效。 |
+
+核心層的開關（`EXL3_DEC_Q4W`、`EXL3_QC_STAGING`、`EXL3_DEC_GROUP` 等）與自己編譯核心的步驟見 [`BUILD.md`](BUILD.md)。
+
 ### 終端機聊天
 
 `models.json` 的 `main`、`draft` 指向主模型和草稿（相對路徑以 runtime 資料夾為準；預設值就是 GGUFRun 的資料夾配置）。之後雙擊 `chat-qwen38.cmd`：32K context、Q4 KV、DFlash2、思考開啟。`/think` 切換思考、`/clear` 清空、`/x` 結束。
@@ -170,6 +197,21 @@ Qwen3.8-27B 自帶視覺塔。`--vision`（GGUFRun 的「視覺」選項）三�
 | 不開草稿 | 約 30 tok/s |
 | 載入時間 | 約 20～25 秒 |
 
+多路同時生成（2.20bpw 主模型＋DFlash2 3.0bpw 草稿、Q4 KV、temp 0.7、8 路各 600 tokens、`-cs 8192`、
+多列快路徑 64 列；共同時間窗內的合計吞吐）：
+
+| 設定 | 8 路合計 | 每路 | 生成中顯存 |
+|---|---|---|---|
+| 8 路、不開草稿 | 206.3 tok/s | 約 25.8 tok/s | 14.69 GiB |
+| 8 路、`-ndt 3` | **245.9 tok/s** | 約 30.8 tok/s | 14.64 GiB |
+| 8 路、`--auto-draft` | 214.1 tok/s | 約 26.8 tok/s | 14.58 GiB |
+| 8 路、`-ndt 7` | 194.3 tok/s | 約 24.3 tok/s | 14.59 GiB |
+
+路數多時草稿深度不是越大越好：8 路 × 草稿 7 ＝ 64 列，驗證成本已經追上收益。`--auto-draft` 會依路數
+自己選；也可以手動固定。2 路時（2.20bpw、`-cs 65536`）`--auto-draft` 實測落在草稿 1～3，合計約 79 tok/s。
+
+以上是單機單次測量的結果，會隨模型量化、Context、取樣參數與背景程式變動；不同量化或溫度不要直接相比。
+
 **顯存快滿時速度會掉很多**：16 GB 卡開 65536 context，模型＋KV 約佔 13 GiB；若 Chrome、桌面等程式又佔了 2.5 GiB 以上，總量逼近 16 GB，Windows 會把部分資料移到共享記憶體，速度可能掉到 40 tok/s 左右。這時：
 
 - context 改成 32768 或 16384；
@@ -183,6 +225,10 @@ Qwen3.8-27B 自帶視覺塔。`--vision`（GGUFRun 的「視覺」選項）三�
 - **防毒軟體攔截**：`python.exe`、`.pyd`、ROCm DLL 都是官方套件原檔，可將資料夾加入例外。
 - **路徑有空白**：可以，已測試搬到含空白的路徑仍正常。
 - **埠被佔用**：換 `--port`；GGUFRun 會偵測上次留下的 EXL3 server 並詢問是否停止。
+- **多路時載入失敗或掉速**：`-cs` 是每路 context，總量＝路數 × `-cs`。8 路 × 65536 會需要 524288 token 的 KV，
+  16 GB 卡放不下；先改成 8 路 × 8192（合計 131072）或降低路數。
+- **改了核心原始碼卻沒效果**：`.hip` 是 hipify 產生檔，已存在時不會重編。用 `tools\build\build_ext.cmd`
+  編譯（會先刪掉舊 `.hip`），細節見 [`BUILD.md`](BUILD.md)。
 
 ## 資料夾內容
 
@@ -191,6 +237,9 @@ Qwen3.8-27B 自帶視覺塔。`--vision`（GGUFRun 的「視覺」選項）三�
 | `python/` | 內附 Python、PyTorch、ROCm、Triton（A 包） |
 | `app/exllamav3/` | ExLlamaV3 1.6.2 原始碼（`app/examples/` 為官方範例與聊天程式） |
 | `native/` | 預編譯擴充 `exllamav3_ext.pyd`、`hip_utils.pyd` |
+| `app/exllamav3/exllamav3_ext/` | C++／HIP 核心原始碼（自行編譯時使用） |
+| `tools/build/` | 重新編譯核心的腳本（`setup_env.cmd`、`build_ext.cmd`） |
+| `BUILD.md` | 編譯核心、`.cu`／`.hip` 關係與核心開關說明 |
 | `server.py` | OpenAI 相容伺服器 |
 | `runtime.py` | 啟動器：隔離環境、設定 DLL 搜尋路徑、檢查 GPU |
 | `web/` | 聊天網頁（llama.cpp WebUI） |

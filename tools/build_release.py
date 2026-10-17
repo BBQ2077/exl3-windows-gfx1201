@@ -2,7 +2,8 @@
 
     python\\python.exe -I tools\\build_release.py <out_dir> <version> [A|B]
 
-Runtime-generated data (cache/, tmp/, logs/, state/, __pycache__/) is never packed or listed in the manifest.
+Runtime-generated data (cache/, tmp/, logs/, state/, __pycache__/), the compile tree build/, *.log, *.prev and
+*.bak* backups are never packed or listed in the manifest.
 models.json ships in the B pack (default GGUFRun layout) but is user-editable, so it is not hashed."""
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -13,14 +14,15 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 MUTABLE = ['models.json', 'cache/', 'tmp/', 'logs/', 'state/', '**/__pycache__/']
-SKIP_DIRS = {'cache', 'tmp', 'logs', 'state', '.git'}
+SKIP_DIRS = {'cache', 'tmp', 'logs', 'state', 'build', '.git'}
 NAME = 'EXL3-gfx1201'
 
 
 def payload():
     for p in sorted(ROOT.rglob('*')):
         rel = p.relative_to(ROOT)
-        if not p.is_file() or rel.parts[0] in SKIP_DIRS or '__pycache__' in rel.parts or p.suffix == '.pyc':
+        if (not p.is_file() or rel.parts[0] in SKIP_DIRS or '__pycache__' in rel.parts or p.suffix in ('.pyc', '.prev', '.log')
+                or '.bak' in p.name):
             continue
         yield rel.as_posix(), p
 

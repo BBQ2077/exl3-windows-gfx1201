@@ -11,8 +11,45 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
+import os
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+
+# Rows (bsz * q_len) the graphed GatedMLP path (BC_GatedMLP.run_bszN) takes; sizes its static scratch.
+# Must match MLP_MAX_ROWS in exllamav3_ext/libtorch/mlp.h. A batched speculative verify is
+# bsz x (draft + 1) rows (4 x 8 = 32); above the limit the eager path runs.
+# EXL3_BC_MLP_MAX_ROWS lowers the limit (8 is the previous behaviour)
+MLP_MAX_ROWS = 32
+_bc_mlp_max_rows = max(1, min(int(os.environ.get("EXL3_BC_MLP_MAX_ROWS", MLP_MAX_ROWS)), MLP_MAX_ROWS))
+
+# Forward controls that Linear.forward / LinearEXL3.forward act on per projection (H capture, output
+# sensitivity capture, projection overrides, forced reconstruction); the fused paths (BC graphs, fused
+# gate+up mgemm) call the kernels directly and would silently skip them
+_PER_PROJECTION_PARAMS = ("capture", "capture_sens", "quant_preserve", "ovr", "reconstruct")
+
+
+def _plain_linear(linear, trim_ok: bool = False) -> bool:
+    """True when Linear.forward adds nothing around the quantized matmul: no LoRA adapter, no
+    output scales or softcap, and (unless the fused path does its own exact-width copy, trim_ok) no
+    padded-output trim. LoRA can be attached after load, so this is checked per forward."""
+    return (
+        not linear.lora_a_tensors and
+        linear.pre_scale == 1.0 and linear.post_scale == 1.0 and linear.softcap == 0.0 and
+        (trim_ok or not (linear.trim_padded_out and linear.out_features != linear.out_features_unpadded))
+    )
+
+
+def _fusable(params: dict, linears, trim_ok: bool = False) -> bool:
+    """May the projections run through a fused path (BC graph or fused gate+up mgemm)? Runs on every
+    MLP forward, so plain loops rather than any()/all() over generators"""
+    if params:
+        for k in _PER_PROJECTION_PARAMS:
+            if k in params:
+                return False
+    for l in linears:
+        if not _plain_linear(l, trim_ok):
+            return False
+    return True
 
 
 def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
@@ -394,9 +431,12 @@ class MLP(Module):
         # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
         # the third invocation on
         bsz, q_len, _ = x.shape
+        # The single captured graph bakes in the output dtype, so only the module's own dtype takes it
         if (
             self.bc is not None and bsz == 1 and q_len == 1 and
-            x.dtype == torch.float16 and x.is_contiguous()
+            x.dtype == torch.float16 and x.is_contiguous() and
+            (out_dtype is None or out_dtype == self.out_dtype) and
+            _fusable(params, (self.ups[0], self.downs[0]), trim_ok = True)   # BC_MLP stages padded dims itself
         ):
             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
@@ -791,10 +831,10 @@ class GatedMLP(Module):
             if mgu is not None or can_separate:
                 out_f = mgu.out_features if mgu is not None else g0.out_features
                 self.bsz1_pa_args = [
-                    (device, (2, MAX_BSZN, self.hidden_size), self.interm_dtype, "gu"),
-                    (device, (2, MAX_BSZN, out_f), self.interm_dtype, "a1"),
-                    (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
-                    (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
+                    (device, (2, MLP_MAX_ROWS, self.hidden_size), self.interm_dtype, "gu"),
+                    (device, (2, MLP_MAX_ROWS, out_f), self.interm_dtype, "a1"),
+                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "a2"),
+                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "down_xh"),
                 ]
                 self.bc = ext.BC_GatedMLP(
                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
@@ -865,12 +905,21 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # LoRA, per-projection forward controls and output post-processing need each
+                # projection's own Linear.forward: neither fused path (BC graph, fused gate+up
+                # mgemm) runs them, so such forwards take the unfused path below
+                fusable = _fusable(params, (self.gates[s], self.ups[s], self.downs[s]))
+
+                if (
+                    self.bc is not None and fusable and bsz * q_len <= _bc_mlp_max_rows and
+                    x.dtype == torch.float16 and x.is_contiguous() and
+                    self.downs[s].out_features == dim
+                ):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
 
-                elif self.multi_gu[s] is None or bsz * q_len > 32:
+                elif self.multi_gu[s] is None or bsz * q_len > 32 or not fusable:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     if "capture_sens" in params:

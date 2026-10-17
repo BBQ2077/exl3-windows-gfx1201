@@ -48,6 +48,8 @@
     "MuseGlimmerAssistantModel",
     "MuseGlimmerForConditionalGeneration",
     "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
+    "NemotronH_Omni_Reasoning_V3",
     "Olmo3ForCausalLM",
     "OlmoHybridForCausalLM",
     "Phi3ForCausalLM",

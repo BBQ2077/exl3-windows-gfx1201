@@ -16,9 +16,17 @@ import torch.nn.functional as F
 
 from ...model.config import Config
 from .. import Module, Linear, RMSNorm, Attention, GatedMLP
+import os
 from ...util.tensor import to2
 
 from ...ext import exllamav3_ext as ext
+
+# EXL3_DFLASH2_HOST_CB: keep the selector codebooks (raw fp16/bf16 [vocab, rank]) in pinned
+# host RAM and serve the CUDA kernels through a zero-copy device alias, exactly like
+# Linear.pin_linears: the kernels take the alias (a real CUDA tensor whose pages live in host
+# memory), so the whole bulk footprint leaves VRAM and every gather read goes over PCIe.
+# Env-gated for A/B testing.
+_dflash2_host_cb = os.environ.get("EXL3_DFLASH2_HOST_CB", "0") != "0"
 
 
 def _grouped_dynamic_convolve_torch(
@@ -265,6 +273,7 @@ class DFlash2Selector(Module):
         self.key_succ = f"{key}.successor_codebook"
         self.pred_codebook = None
         self.succ_codebook = None
+        self._pinned_store = {}
         self.caps.update({"x_cpu": True})
 
     def optimizer_targets(self):
@@ -282,34 +291,78 @@ class DFlash2Selector(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
-        # Older trainers append .weight to the bare codebook keys;
-        # try bare first, fall back to suffixed (same bytes either way).
-        self.pred_codebook = self.config.stc.get_tensor(
-            self.key_pred, self.device, optional = True, allow_bf16 = True)
-        if self.pred_codebook is None:
-            self.pred_codebook = self.config.stc.get_tensor(
-                self.key_pred + ".weight", self.device, optional = False, allow_bf16 = True)
-        self.succ_codebook = self.config.stc.get_tensor(
-            self.key_succ, self.device, optional = True, allow_bf16 = True)
-        if self.succ_codebook is None:
-            self.succ_codebook = self.config.stc.get_tensor(
-                self.key_succ + ".weight", self.device, optional = False, allow_bf16 = True)
+        # Codebooks come raw (fp16/bf16 [vocab, rank]); older trainers append .weight to the bare
+        # keys (same bytes). Host-resident mode pins the bulk tensor and aliases it zero-copy.
+        self.pred_codebook = self._raw_codebook(self.key_pred)
+        self.succ_codebook = self._raw_codebook(self.key_succ)
         expected_shape = (self.vocab_size, self.rank)
-        if self.pred_codebook.shape != expected_shape:
-            raise ValueError(
-                f"Expected {self.key_pred} shape {expected_shape}, "
-                f"got {tuple(self.pred_codebook.shape)}"
-            )
-        if self.succ_codebook.shape != expected_shape:
-            raise ValueError(
-                f"Expected {self.key_succ} shape {expected_shape}, "
-                f"got {tuple(self.succ_codebook.shape)}"
-            )
+        for name, cb in ((self.key_pred, self.pred_codebook), (self.key_succ, self.succ_codebook)):
+            if cb.shape != expected_shape:
+                raise ValueError(
+                    f"Expected {name} shape {expected_shape}, got {tuple(cb.shape)}"
+                )
+
+
+    def _raw_codebook(self, key: str) -> torch.Tensor:
+        # _load_codebook returns (raw tensor, None) or (None, quantized parts); the walk kernels in
+        # this tree take the raw [vocab, rank] table only
+        cb, qparts = self._load_codebook(key)
+        if cb is None:
+            raise ValueError(f"{key}: quantized selector codebooks ({key}.q) are not supported by this build")
+        return cb
+
+    def _load_codebook(self, key: str) -> torch.Tensor:
+        # Host-resident mode (EXL3_DFLASH2_HOST_CB): the bulk tensor loads into CPU memory and is
+        # page-locked + zero-copy aliased; no_defer because the pinned copy must be complete when
+        # we take it
+        host = _dflash2_host_cb and self.device.type == "cuda"
+        ld = torch.device("cpu") if host else self.device
+        q = self.config.stc.get_tensor(f"{key}.q", ld, optional = True, no_defer = host, arena = not host)
+        if q is None:
+            cb = self.config.stc.get_tensor(key, ld, optional = True, allow_bf16 = True, no_defer = host, arena = not host)
+            if cb is None:
+                cb = self.config.stc.get_tensor(key + ".weight", ld, optional = False, allow_bf16 = True, no_defer = host, arena = not host)
+            return (self._pin_alias(key, cb) if host else cb), None
+        if self.rank != 256:
+            raise ValueError(f"{key}: quantized codebooks require rank 256 (got {self.rank})")
+        q = q.contiguous()
+        if q.size(0) != self.vocab_size:
+            raise ValueError(f"Expected {key}.q shape ({self.vocab_size}, ...), got {tuple(q.shape)}")
+        scales = self.config.stc.get_tensor(f"{key}.scales", self.device, optional = False).contiguous()
+        mins = self.config.stc.get_tensor(f"{key}.mins", self.device, optional = True)
+        if mins is not None:
+            mins = mins.contiguous()
+        out = {
+            "q": self._pin_alias(f"{key}.q", q) if host else q,
+            "scales": scales,
+            "mins": mins,
+        }
+        return None, out
+
+
+    def _pin_alias(self, key: str, t: torch.Tensor) -> torch.Tensor:
+        # Page-lock a copy of the bulk tensor and hand the kernels a zero-copy CUDA alias of
+        # it (same pattern as Linear.pin_linears). The alias does not own the memory: the
+        # pinned source lives in _pinned_store for the module's lifetime and doubles as the
+        # export value in get_tensors
+        if t.device.type != "cpu":
+            raise ValueError(f"{key}: expected a CPU tensor to pin, got {t.device}")
+        try:
+            pinned = t.pin_memory()
+            alias = ext.pinned_cuda_view(pinned, self.device.index if self.device.index is not None else 0)
+        except Exception as e:
+            # Host-resident mode unavailable here: keep the codebook in VRAM
+            print(f" -- EXL3_DFLASH2_HOST_CB: {key} stays in VRAM ({type(e).__name__}: {e})", flush = True)
+            return t.to(self.device)
+        self._pinned_store[key] = pinned
+        return alias
+
 
     @override
     def unload(self):
         self.pred_codebook = None
         self.succ_codebook = None
+        self._pinned_store.clear()
         super().unload()
 
     @override
@@ -318,6 +371,7 @@ class DFlash2Selector(Module):
         if self.pred_codebook is not None:
             t[self.key_pred] = self.pred_codebook.contiguous()
             t[self.key_succ] = self.succ_codebook.contiguous()
+        t.update(self._pinned_store)  # host-resident mode: export the sources, not the aliases
         return t
 
     def walk(
@@ -396,6 +450,60 @@ class DFlash2Selector(Module):
             )
             return out, conf
         return self._walk_torch(unary.float(), cands.long(), gate.float(), anchor_ids, return_confidence)
+
+
+    def walk_sample(
+        self,
+        hidden: torch.Tensor,
+        logits: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        temperature: float,
+        vocab_size: int | None = None,
+        scale: float = 1.0,
+        softcap: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sampled selector walk for speculative sampling (dflash reference CandidateSelector.select at
+        temperature > 0): at each row the next token is drawn from q = softmax(scores / T) over the row's top-k
+        candidates, scores conditioned on the previously drawn token. Returns ids [b, rows + 1] = [anchor, path...],
+        q [b, rows, k] and the candidates [b, rows, k], so the verifier can accept with min(1, p / q)."""
+        vocab_size = vocab_size or logits.shape[-1]
+        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        bsz, rows = logits.shape[:2]
+        if hidden.is_cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
+            unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
+            ext.dflash2_topk(logits, vocab_size, scale, softcap, unary, cands)
+        else:
+            lg = logits[..., :vocab_size].float() * scale
+            if softcap > 0.0:
+                lg = torch.tanh(lg / softcap) * softcap
+            unary, cands = torch.topk(lg, self.top_k, dim = -1, sorted = False)
+        u = torch.rand((bsz, rows, self.top_k), device = hidden.device, generator = generator)
+        gumbel = -torch.log(-torch.log(u.clamp_min(1e-20)))
+        if hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16):
+            out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
+            q = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            ext.dflash2_selector_walk_sample(
+                unary.float().contiguous(), cands.long().contiguous(), gate.contiguous(),
+                self.pred_codebook, self.succ_codebook, anchor_ids.long().to(hidden.device, non_blocking = anchor_ids.is_pinned()).contiguous(),
+                out, gumbel.contiguous(), q, float(temperature),
+            )
+            return out, q, cands
+        gate = gate.float()
+        pred = anchor_ids.long().to(hidden.device)
+        path = [pred]
+        qs = []
+        for i in range(rows):
+            a_emb = F.embedding(pred, self.pred_codebook).float()
+            b_emb = F.embedding(cands[:, i], self.succ_codebook).float()
+            scores = unary[:, i].float() + torch.einsum("br,bkr->bk", a_emb * gate[:, i], b_emb)
+            logq = torch.log_softmax(scores / temperature, dim = -1)
+            idx = torch.argmax(logq + gumbel[:, i], dim = -1)
+            pred = cands[:, i].gather(-1, idx[:, None])[:, 0]
+            path.append(pred)
+            qs.append(logq.exp())
+        return torch.stack(path, dim = 1), torch.stack(qs, dim = 1), cands
 
 
     def _walk_torch(self, unary, cands, gate, anchor_ids, return_confidence):

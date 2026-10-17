@@ -2,6 +2,23 @@
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import argparse
+import os
+# 加速開關要在載入 exllamav3 之前寫進環境變數，所以先從命令列取值（argparse 也有登記同名參數）
+def _pre_flag(name):
+    for i, a in enumerate(sys.argv):
+        if a == name:
+            return sys.argv[i + 1] if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('-') else '1'
+        if a.startswith(name + '='):
+            return a.split('=', 1)[1]
+    return None
+import sys
+# RDNA4 多列 WMMA GEMV（8～64 列）：server 預設開、64 列
+os.environ['EXL3_GEMV_WMMA'] = _pre_flag('--gemv-wmma') or os.environ.get('EXL3_GEMV_WMMA', '1')
+os.environ['EXL3_GEMV_MAX_M'] = _pre_flag('--gemv-max-m') or os.environ.get('EXL3_GEMV_MAX_M', '64')
+if _pre_flag('--dflash2-host-cb'):
+    os.environ['EXL3_DFLASH2_HOST_CB'] = '1'
+if _pre_flag('--qc-staging-sliced'):
+    os.environ['EXL3_QC_STAGING_SLICED'] = '1'
 import base64
 import binascii
 from collections import OrderedDict
@@ -11,6 +28,7 @@ import hashlib
 import io
 import json
 import math
+import queue
 import re
 import select
 import socket
@@ -96,6 +114,69 @@ def load_hf_template(model_dir):
     return t if isinstance(t, str) and t.strip() else None
 
 
+EFFORT_LEVELS = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+
+
+def template_reasoning_efforts(tree):
+    """讀取模板明列的 reasoning_effort 集合，不推測模型名稱或更改模板。"""
+    from jinja2 import nodes
+    names = {'reasoning_effort'}
+    assignments = list(tree.find_all(nodes.Assign))
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            target, value = assignment.target, assignment.node
+            refs = ([value] if isinstance(value, nodes.Name) else []) + list(value.find_all(nodes.Name))
+            if isinstance(target, nodes.Name) and target.name not in names and any(n.name in names for n in refs):
+                names.add(target.name)
+                changed = True
+    declared = []
+    for comparison in tree.find_all(nodes.Compare):
+        if not isinstance(comparison.expr, nodes.Name) or comparison.expr.name not in names:
+            continue
+        if len(comparison.ops) != 1:
+            continue
+        operand = comparison.ops[0]
+        if operand.op not in ('in', 'notin') or not isinstance(operand.expr, (nodes.Tuple, nodes.List)):
+            continue
+        items = operand.expr.items
+        if items and all(isinstance(item, nodes.Const) and isinstance(item.value, str) for item in items):
+            declared.append(tuple(item.value for item in items))
+    return declared[0] if declared and all(values == declared[0] for values in declared) else ()
+
+
+def resolve_reasoning(body, kwargs, default_effort, default_thinking, supported=()):
+    """每次請求重新解析；客戶端設定優先，只有未支援的標準層級才做對應。"""
+    think = body.get('enable_thinking', kwargs.get('enable_thinking', default_thinking))
+    if not isinstance(think, bool):
+        raise ValueError('enable_thinking 必須是布林值')
+    effort = body.get('reasoning_effort')
+    if effort is None:
+        effort = kwargs.get('reasoning_effort')
+    requested = effort
+    if effort is None or (isinstance(effort, str) and effort.strip().lower() in ('', 'default', 'auto')):
+        effort = default_effort
+    if effort is not None:
+        if not isinstance(effort, str):
+            raise ValueError('reasoning_effort 必須是字串')
+        effort = effort.strip()
+        if effort.lower() in ('', 'default', 'auto'):
+            effort = None
+        elif effort.lower() in ('none', 'off', 'disabled', 'false'):
+            think, effort = False, None
+        elif effort.lower() in EFFORT_LEVELS:
+            effort = effort.lower()
+    if not think:
+        return False, None, requested
+    if supported and effort is not None and effort not in supported:
+        available = [level for level in EFFORT_LEVELS if level in supported]
+        if effort in EFFORT_LEVELS and available:
+            rank = EFFORT_LEVELS.index(effort)
+            effort = next((level for level in available if EFFORT_LEVELS.index(level) >= rank), available[-1])
+    return think, effort, requested
+
+
 class HFTemplate:
     """Render a model's own chat_template with the same Jinja rules Hugging Face uses."""
     def __init__(self, source, bos, eos):
@@ -113,7 +194,9 @@ class HFTemplate:
         env.filters['tojson'] = tojson
         env.globals['raise_exception'] = raise_exception
         env.globals['strftime_now'] = lambda fmt: datetime.now().strftime(fmt)
-        self.template = env.from_string(source)
+        tree = env.parse(source)
+        self.reasoning_efforts = template_reasoning_efforts(tree)
+        self.template = env.from_string(tree)
         self.bos, self.eos = bos or '', eos or ''
 
     def render(self, messages, think, extra=None, tools=None):
@@ -473,8 +556,9 @@ class LiveTimings:
 
 class ProgressLog:
     """生成途中每隔幾秒印一行進度，比照 llama-server 的 prompt processing／n_gen、tg、tg_3s。"""
-    def __init__(self, live, interval=3.0, clock=time.time):
+    def __init__(self, live, interval=3.0, clock=time.time, request_id=None):
         self.live, self.interval, self.clock = live, interval, clock
+        self.prefix = f'[{request_id}] ' if request_id else ''
         self.last, self.mark = clock(), None
 
     def prefill(self, result):
@@ -484,7 +568,7 @@ class ProgressLog:
         self.last = now
         p = self.live.progress(result)
         done, todo, sec = max(0, p['processed'] - p['cache']), max(0, p['total'] - p['cache']), p['time_ms'] / 1000
-        log(f'[EXL3] 預填 {done}/{todo} tok' + (f'（{done / todo:.0%}）' if todo else '') + f'｜{sec:.1f} s'
+        log(self.prefix + f'[EXL3] 預填 {done}/{todo} tok' + (f'（{done / todo:.0%}）' if todo else '') + f'｜{sec:.1f} s'
             + (f'｜{done / sec:.1f} tok/s' if sec else ''))
 
     def generate(self):
@@ -500,7 +584,7 @@ class ProgressLog:
                f'近 {now - self.mark[0]:.0f} 秒 {recent:.1f} tok/s']
         if t.get('draft_n'):
             out.append(f"草稿接受 {t['draft_n_accepted']}/{t['draft_n']}（{t['draft_n_accepted'] / t['draft_n']:.0%}）")
-        log('｜'.join(out))
+        log(self.prefix + '｜'.join(out))
         self.mark, self.last = (now, n), now
 
 
@@ -515,14 +599,207 @@ def response_budget(prompt, context, requested, draft):
     return min(requested, available) if requested else available
 
 
+class RequestState:
+    """One HTTP request. Only the scheduler touches its Job or the shared GPU."""
+    def __init__(self, body, slot):
+        self.body, self.slot = body, slot
+        self.rid = 'chatcmpl-' + uuid.uuid4().hex
+        self.prepared, self.done, self.cancelled = threading.Event(), threading.Event(), threading.Event()
+        self.results = queue.Queue(maxsize=256)
+        self.job, self.serial, self.info, self.error = None, None, None, None
+
+
+class AutoDraft:
+    """--auto-draft：依實測每秒產出的 token 數，替目前同時生成的路數挑草稿數。
+    檔位 0（暫停打草稿，草稿模型照樣跟著同步）～-ndt；每個路數各自量；換檔要贏 5% 以上，之後定期重試鄰近檔位。"""
+    WARM, EMA, REPROBE, MARGIN = 6, 0.15, 400, 1.05
+
+    def __init__(self, generator, ceiling):
+        self.gen, self.ceiling = generator, ceiling
+        self.cands = sorted({c for c in (0, 1, 2, 3, 4, 5, 7, ceiling) if 0 <= c <= ceiling})
+        self.stats, self.cur, self.count, self.probe = {}, {}, {}, {}
+
+    def pick(self, active):
+        key = active
+        self.count[key] = self.count.get(key, 0) + 1
+        if self.probe.get(key):
+            ndt, left = self.probe[key]
+            self.probe[key] = (ndt, left - 1) if left > 1 else None
+            return ndt
+        for c in self.cands:
+            if self.stats.get((key, c), (0, 0))[1] < self.WARM:
+                return c
+        cur = self.cur.get(key)
+        best = max(self.cands, key=lambda c: self.stats[(key, c)][0])
+        if cur is None or self.stats[(key, best)][0] > self.stats[(key, cur)][0] * self.MARGIN:
+            if cur != best:
+                rate = {c: round(self.stats[(key, c)][0], 1) for c in self.cands}
+                log(f'[EXL3] 自動草稿｜{active} 路 → ' + (f'草稿 {best} token' if best else '暫停草稿') + f'（實測 tok/s：{rate}）')
+            self.cur[key] = cur = best
+        if self.count[key] % self.REPROBE == 0:
+            i = self.cands.index(cur)
+            near = [self.cands[j] for j in (i - 1, i + 1) if 0 <= j < len(self.cands)]
+            if near:
+                self.probe[key] = (near[(self.count[key] // self.REPROBE) % len(near)], 3)
+        return cur
+
+    def record(self, active, ndt, tokens, seconds):
+        if tokens <= 0 or seconds <= 0:
+            return
+        rate = tokens / seconds
+        old = self.stats.get((active, ndt))
+        self.stats[(active, ndt)] = (rate, 1) if old is None else (old[0] + self.EMA * (rate - old[0]), old[1] + 1)
+
+
+class GenerationScheduler:
+    """Single GPU owner: continuously batch jobs and demultiplex results by serial.
+
+    HTTP threads only reserve a slot, consume their own bounded result queue and set
+    cancellation events. No HTTP thread calls prepare/enqueue/iterate/cancel.
+    """
+    def __init__(self, engine, parallel):
+        self.engine, self.parallel = engine, parallel
+        self.condition = threading.Condition()
+        self.requests, self.by_serial = {}, {}
+        self.stopping = False
+        self.thread = threading.Thread(target=self.run, name='exl3-generation', daemon=True)
+        self.thread.start()
+
+    def submit(self, body):
+        with self.condition:
+            if self.stopping or not self.engine.ready:
+                raise RuntimeError('生成服務尚未就緒')
+            used = {r.slot for r in self.requests.values()}
+            slot = next((s for s in range(self.parallel) if s not in used), None)
+            if slot is None:
+                return None
+            state = RequestState(body, slot)
+            self.requests[state.rid] = state
+            self.condition.notify()
+            return state
+
+    def snapshot(self):
+        with self.condition:
+            return [{'id': r.slot, 'request_id': r.rid, 'is_processing': True}
+                    for r in self.requests.values()]
+
+    def cancel(self, rid):
+        with self.condition:
+            state = self.requests.get(rid)
+            if state is None:
+                return False
+            state.cancelled.set()
+            self.condition.notify()
+            return True
+
+    def close(self):
+        with self.condition:
+            self.stopping = True
+            for state in self.requests.values():
+                state.cancelled.set()
+            self.condition.notify()
+        self.thread.join(timeout=5)
+
+    def finish(self, state, error=None, cancel=False):
+        """Called only on the GPU owner thread; release GPU state before the slot."""
+        try:
+            if cancel and state.job is not None:
+                self.engine.generator.cancel(state.job)
+        finally:
+            state.error = error
+            if state.info is None and state.error is None:
+                state.error = ValueError('請求已取消')
+            with self.condition:
+                if state.serial is not None:
+                    self.by_serial.pop(state.serial, None)
+                self.requests.pop(state.rid, None)
+            state.prepared.set()
+            state.done.set()
+
+    def run(self):
+        try:
+            with self.engine.torch.inference_mode():
+                self._run()
+        except Exception:
+            # An unexpected engine/iterate failure can leave the shared GPU state
+            # inconsistent. Stop admission rather than reuse it for another request.
+            error = traceback.format_exc()
+            self.engine.error, self.engine.ready = error, False
+            log('[EXL3] 生成服務錯誤：' + error)
+            with self.condition:
+                self.stopping = True
+                remaining = list(self.requests.values())
+            for state in remaining:
+                try:
+                    self.finish(state, RuntimeError(error), cancel=True)
+                except Exception:
+                    log(traceback.format_exc())
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.requests or self.stopping)
+                states = list(self.requests.values())
+                if self.stopping and not states:
+                    return
+            for state in states:
+                if state.cancelled.is_set():
+                    self.finish(state, cancel=True)
+                    continue
+                if state.prepared.is_set():
+                    continue
+                try:
+                    state.info = self.engine.prepare(state.body)
+                    state.job = state.info[0]
+                    state.serial = self.engine.generator.enqueue(state.job)
+                    self.by_serial[state.serial] = state
+                    state.body = None
+                    state.prepared.set()
+                    log(f'[EXL3] 請求 {state.rid}｜槽位 {state.slot + 1}/{self.parallel}')
+                except (ValueError, TypeError, KeyError, AssertionError) as exc:
+                    self.finish(state, ValueError(str(exc)), cancel=True)
+            if not self.by_serial:
+                continue
+            discarded = set()
+            gen, auto = self.engine.generator, self.engine.auto_draft
+            if auto is not None:
+                jobs = list(gen.active_jobs)
+                ndt = gen.num_draft_tokens = auto.pick(len(jobs)) if jobs else auto.ceiling
+                before = sum(j.new_tokens for j in jobs)
+                t0 = time.perf_counter()
+            results = gen.iterate()
+            if auto is not None and jobs:
+                if not any(r.get('stage') == 'prefill' for r in results) and all(j in gen.active_jobs for j in jobs):
+                    auto.record(len(jobs), ndt, sum(j.new_tokens for j in jobs) - before, time.perf_counter() - t0)
+            for result in results:
+                if result.get('serial') in discarded:
+                    continue
+                state = self.by_serial.get(result.get('serial'))
+                if state is None:
+                    raise RuntimeError('生成結果缺少有效的請求 serial')
+                if result.get('error') is not None:
+                    discarded.add(state.serial)
+                    self.finish(state, RuntimeError(str(result['error'])), cancel=True)
+                    continue
+                try:
+                    state.results.put_nowait(result)
+                except queue.Full:
+                    state.cancelled.set()
+                    discarded.add(state.serial)
+                    self.finish(state, RuntimeError('客戶端讀取過慢，已停止此請求'), cancel=True)
+                    continue
+                if result.get('eos'):
+                    self.finish(state)
+
+
 class Engine:
     def __init__(self, args):
         self.args = args
         self.ready = False
         self.error = None
-        self.lock = threading.Lock()
-        self.cancelled = threading.Event()
-        self.request_id = None
+        self.parallel = getattr(args, 'parallel', 2)
+        self.scheduler = None
+        self.auto_draft = None
         self.latest = None
         self.vision = None                  # ExLlamaV3 視覺塔（--vision gpu／ram 才載入）
         self.images = OrderedDict()         # 圖片 sha256 → MMEmbedding：同一張圖在後續輪次沿用，前文快取才接得上
@@ -572,13 +849,55 @@ class Engine:
             from exllamav3.constants import PAGE_SIZE
             self.torch, self.Job, self.page_size = torch, Job, PAGE_SIZE
             with torch.inference_mode():
-                model, self.config, self.cache, self.tokenizer, draft_model, _, draft_cache = model_init.init(self.args)
+                draft_path = self.args.draft_model_dir
+                portable = None
+                if draft_path:
+                    dc = json.loads((Path(draft_path) / 'config.json').read_text(encoding='utf-8'))
+                    if dc.get('architectures') == ['LiLiCorrDraftModel']:
+                        from lilicorr import LiLiCorrEXL3, load_weights, reference_module
+                        portable = LiLiCorrEXL3(draft_path, load_weights(Path(draft_path)), reference_module())
+                        if self.args.chunk_size > portable.c.window:
+                            self.args.chunk_size = portable.c.window
+                        self.args.draft_model_dir = None
+                        self.args.num_draft_tokens = min(max(1, self.args.num_draft_tokens or portable.c.slots), portable.c.slots)
+                try:
+                    load_args = copy.copy(self.args)
+                    load_args.cache_size = self.args.cache_size * self.parallel
+                    load_args.autosplit_max_batch_size = self.parallel
+                    model, self.config, self.cache, self.tokenizer, draft_model, _, draft_cache = model_init.init(
+                        load_args, min_draft_len=portable.c.slots if portable else None,
+                        override_dynamic_seq_len=self.args.cache_size)
+                finally:
+                    self.args.draft_model_dir = draft_path
+                if portable:
+                    from types import SimpleNamespace
+                    portable.attach_to(model)
+                    draft_model = portable
+                    draft_cache = SimpleNamespace(max_num_tokens=self.cache.max_num_tokens,
+                        initialized=True, max_history=portable.c.slots)
+                    log(f'[EXL3] LiLiCorr：原生 Windows，{portable.c.num_hidden_layers} 層，草稿 {self.args.num_draft_tokens} token')
                 self.generator = Generator(model=model, cache=self.cache, tokenizer=self.tokenizer,
                     draft_model=draft_model, draft_cache=draft_cache, num_draft_tokens=self.args.num_draft_tokens,
-                    max_batch_size=1, max_chunk_size=self.args.chunk_size, cpu_cache_size=0,
+                    max_batch_size=self.parallel, max_chunk_size=self.args.chunk_size,
+                    cpu_cache_size=int((self.args.cpu_cache_size or 0) * 1024**3),
+                    disk_cache_dir=self.args.disk_cache_dir if self.args.cpu_cache_size else None,
+                    disk_cache_size=int((self.args.disk_cache_size or 50) * 1024**3),
                     recurrent_cache_size=int(max(0.0, self.args.recurrent_cache_size) * 1024 ** 3),
                     dynamic_draft_tokens=self.args.dynamic_draft, draft_confidence=self.args.draft_confidence,
                     ngram_match_min=self.args.ngram_match_min, hybrid_draft_tokens=self.args.hybrid_draft_tokens)
+                log(f"[EXL3] 加速：多列快路徑 {'開' if os.environ.get('EXL3_GEMV_WMMA') != '0' else '關'}"
+                    f"（上限 {os.environ.get('EXL3_GEMV_MAX_M')} 列）"
+                    f"｜#490 草稿查表放 RAM {'開' if os.environ.get('EXL3_DFLASH2_HOST_CB') == '1' else '關'}"
+                    f"｜#517 分段搬運 {'開' if os.environ.get('EXL3_QC_STAGING_SLICED') == '1' else '關'}"
+                    f"｜前文快取 RAM {self.args.cpu_cache_size or 0:g} GB"
+                    + (f"／SSD {self.args.disk_cache_dir}（上限 {self.args.disk_cache_size or 50:g} GB）" if self.args.cpu_cache_size and self.args.disk_cache_dir else '')
+                    + (f"｜重複內容長草稿 {self.args.hybrid_draft_tokens}" if self.args.hybrid_draft_tokens else '')
+                    + (f"｜n-gram 草稿 {self.args.ngram_match_min}" if self.args.ngram_match_min else ''))
+                if self.args.auto_draft and self.generator.num_draft_tokens >= 1 and self.generator.draft_model is not None:
+                    self.auto_draft = AutoDraft(self.generator, self.generator.num_draft_tokens)
+                    log(f'[EXL3] 自動草稿：開，檔位 {self.auto_draft.cands}')
+                if self.generator.max_batch_size < self.parallel:
+                    raise RuntimeError('引擎狀態槽數不足，無法提供指定的同時生成數')
                 self.load_vision()
             mode = self.args.chat_mode
             self.hf_template, self.formatter = None, None
@@ -608,28 +927,43 @@ class Engine:
                 stops.append(self.tokenizer.eos_token_id)
             self.stop_ids = sorted(set(stops))
             self.draft_tokens = self.generator.max_draft_tokens
+            self.scheduler = GenerationScheduler(self, self.parallel)
             self.ready = True
+            log(f'[EXL3] 同時生成 {self.parallel} 路｜每路 Context {self.args.cache_size}｜'
+                f'總 KV 容量 {self.cache.max_num_tokens} token；主模型與草稿各載一份')
             audit = globals().get('runtime_write_audit')
             if audit:
                 audit()
             print('EXL3_SERVER_READY', json.dumps(self.props(), ensure_ascii=False), flush=True)
         except Exception:
+            self.ready = False
+            if self.scheduler:
+                self.scheduler.close()
             self.error = traceback.format_exc()
             print('EXL3_SERVER_LOAD_ERROR', self.error, flush=True)
 
+    def slots(self):
+        active = {s['id']: s for s in self.scheduler.snapshot()} if self.scheduler else {}
+        return [dict(id=i, n_ctx=self.args.cache_size, is_processing=False, request_id=None)
+                | active.get(i, {}) for i in range(self.parallel)]
+
     def props(self):
+        active = [s for s in self.slots() if s['is_processing']]
+        request_ids = [s['request_id'] for s in active]
         return {'backend': 'exllamav3', 'status': 'ok' if self.ready else ('error' if self.error else 'loading'),
             'error': self.error, 'model_path': self.args.model_dir, 'alias': self.args.alias,
             'default_generation_settings': {'n_ctx': self.args.cache_size, 'params': {
                 'temperature': self.args.temperature, 'top_p': self.args.top_p, 'top_k': self.args.top_k,
                 'min_p': self.args.min_p, 'n_predict': -1}},
-            'total_slots': 1, 'model_alias': self.args.alias,
+            'total_slots': self.parallel, 'active_slots': len(active),
+            'total_context': self.args.cache_size * self.parallel, 'model_alias': self.args.alias,
             'modalities': {'vision': self.vision is not None, 'audio': False},
             'vision': self.args.vision if self.vision is not None else 'off',
             'build_info': 'exllamav3',
             'draft_model': self.args.draft_model_dir, 'chat_mode': getattr(self, 'mode', self.args.chat_mode),
-            'thinking': self.args.thinking != 'off', 'busy': self.lock.locked(),
-            'request_id': self.request_id, 'latest': self.latest}
+            'thinking': self.args.thinking != 'off', 'busy': bool(active),
+            'request_id': request_ids[0] if len(request_ids) == 1 else None,
+            'request_ids': request_ids, 'latest': self.latest}
 
     def prepare(self, body):
         if body.get('response_format') not in (None, {'type': 'text'}):
@@ -642,10 +976,9 @@ class Engine:
         kwargs = body.get('chat_template_kwargs') or {}
         if not isinstance(kwargs, dict) or not all(isinstance(k, str) for k in kwargs):
             raise ValueError('chat_template_kwargs 必須是 JSON object')
-        # 頂層 enable_thinking 優先；其次是 llama.cpp／vLLM 慣用的 chat_template_kwargs.enable_thinking
-        think = body.get('enable_thinking', kwargs.get('enable_thinking', self.args.thinking != 'off'))
-        if not isinstance(think, bool):
-            raise ValueError('enable_thinking 必須是布林值')
+        think, effort, requested_effort = resolve_reasoning(
+            body, kwargs, self.args.reasoning_effort, self.args.thinking != 'off',
+            getattr(self.hf_template, 'reasoning_efforts', ()))
         embeddings = []
         image = None
         if self.vision is not None:
@@ -655,11 +988,9 @@ class Engine:
                     embeddings.append(emb)
                 return emb.text_alias
         if self.hf_template:
-            extra = {k: v for k, v in kwargs.items() if k not in ('messages', 'enable_thinking', 'add_generation_prompt')}
-            effort = body.get('reasoning_effort', self.args.reasoning_effort)
+            extra = {k: v for k, v in kwargs.items() if k not in
+                     ('messages', 'enable_thinking', 'add_generation_prompt', 'reasoning_effort')}
             if effort is not None:
-                if not isinstance(effort, str):
-                    raise ValueError('reasoning_effort 必須是字串')
                 extra['reasoning_effort'] = effort
             try:
                 text = self.hf_template.render(template_messages(body.get('messages'), image), think, extra, tools)
@@ -677,7 +1008,8 @@ class Engine:
                 text += self.formatter.thinktag()[0]
             ids = self.tokenizer.encode(text, add_bos=self.formatter.add_bos(), encode_special_tokens=True)
         requested = body.get('max_completion_tokens', body.get('max_tokens', body.get('n_predict', 0)))
-        limit = response_budget(ids.shape[-1], self.generator.max_total_tokens, requested, self.draft_tokens)
+        context = min(getattr(self.args, 'cache_size', self.generator.max_total_tokens), self.generator.max_total_tokens)
+        limit = response_budget(ids.shape[-1], context, requested, self.draft_tokens)
         sampler_args = copy.copy(self.args)
         mapping = {'temperature': 'temperature', 'top_p': 'top_p', 'top_k': 'top_k', 'min_p': 'min_p',
                    'presence_penalty': 'presence_penalty', 'frequency_penalty': 'frequency_penalty',
@@ -706,6 +1038,10 @@ class Engine:
         seed = body.get('seed')
         if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
             raise ValueError('seed 必須是整數')
+        actual_effort = (effort or '預設') if think else '關閉思考'
+        if think and not self.hf_template:
+            actual_effort = '內建模板（不區分強度）'
+        log(f"[思考] 請求 {requested_effort or 'default'} → 模型 {actual_effort}")
         return self.Job(input_ids=ids, max_new_tokens=limit, sampler=sampler,
             stop_conditions=stop + extra_stop, seed=seed, embeddings=embeddings or None), limit, implicit, \
             int(ids.shape[-1]), tools
@@ -756,6 +1092,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(payload)))
+        if self.close_connection:
+            self.send_header('Connection', 'close')
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(payload)
@@ -800,21 +1138,30 @@ class Handler(BaseHTTPRequestHandler):
                 'context_length': engine.args.cache_size}]})
         elif path == '/slots':
             # llama.cpp 網頁用來判斷是否閒置
-            self.send_json(200, [{'id': 0, 'n_ctx': engine.args.cache_size, 'is_processing': engine.lock.locked()}])
+            self.send_json(200, engine.slots())
         elif path == '/tools':
             # 403＝伺服器端工具未開啟；llama.cpp 網頁收到後安靜略過
             self.send_json(403, {'error': {'message': '此伺服器未提供伺服器端工具'}})
         else:
             self.send_json(404, {'error': {'message': 'Unknown endpoint'}})
 
+    def disconnected(self):
+        try:
+            return bool(select.select([self.connection], [], [], 0)[0]
+                        and self.connection.recv(1, socket.MSG_PEEK) == b'')
+        except OSError:
+            return True
+
     def do_POST(self):
         engine = self.server.engine
         if self.route() == '/tools':
+            self.close_connection = True
             self.send_json(403, {'error': {'message': '此伺服器未提供伺服器端工具'}})
             return
         try:
             body = self.read_body()
         except (ValueError, TypeError, UnicodeError) as exc:
+            self.close_connection = True
             self.send_json(400, {'error': {'message': str(exc)}})
             return
         path = self.route()
@@ -826,9 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == '/cancel':
             requested = body.get('request_id')
-            ok = bool(requested and requested == engine.request_id)
-            if ok:
-                engine.cancelled.set()
+            ok = bool(isinstance(requested, str) and engine.scheduler and engine.scheduler.cancel(requested))
             self.send_json(200, {'cancelled': ok})
             return
         if path != '/v1/chat/completions':
@@ -839,133 +1184,142 @@ class Handler(BaseHTTPRequestHandler):
                                            'message': engine.error or '模型載入中，請稍候再送出'}})
             return
         if body.get('n_predict') == 0 and not body.get('stream'):
-            # llama.cpp 網頁打字時的預先編碼請求：直接回空結果，不佔用生成鎖
+            # llama.cpp 網頁打字時的預先編碼請求：直接回空結果，不佔用生成槽位
             self.send_json(200, {'id': 'chatcmpl-' + uuid.uuid4().hex, 'object': 'chat.completion',
                 'created': int(time.time()), 'model': engine.args.alias,
                 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': ''}, 'finish_reason': 'length'}],
                 'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}})
             return
-        if not engine.lock.acquire(blocking=False):
-            self.send_json(409, {'error': {'message': '模型正在生成；請等目前請求完成或按停止'}})
+        try:
+            state = engine.scheduler.submit(body)
+        except RuntimeError as exc:
+            self.send_json(503, {'error': {'message': str(exc)}})
+            return
+        if state is None:
+            self.send_json(409, {'error': {'message': '同時生成槽位已滿；請稍後重試或停止其中一個請求'}})
             return
         job, streaming, started = None, False, time.perf_counter()
         try:
-            with engine.torch.inference_mode():
-                job, capacity, implicit, prompt_count, tools = engine.prepare(body)
-                rid = 'chatcmpl-' + uuid.uuid4().hex
-                engine.request_id = rid
-                engine.cancelled.clear()
-                created = int(time.time())
-                live = LiveTimings(job, prompt_count, getattr(engine, 'page_size', 256))
-                progress_log = ProgressLog(live)
-                want_progress = bool(body.get('return_progress'))
-                clock = {'write': time.perf_counter(), 'timings': 0.0}
-                def event(delta, finish=None, usage=None, metrics=None, timings=None, progress=None):
-                    obj = {'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': engine.args.alias,
-                        'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
-                    if usage is not None:
-                        obj['usage'] = usage
-                    if timings is not None:
-                        obj['timings'] = timings
-                    if progress is not None:
-                        obj['prompt_progress'] = progress
-                    if metrics is not None:
-                        obj['exl3'] = metrics
-                    self.wfile.write(('data: ' + json.dumps(obj, ensure_ascii=False) + '\n\n').encode('utf-8'))
+            while not state.prepared.wait(timeout=0.1):
+                if self.disconnected():
+                    state.cancelled.set()
+                    return
+            if state.error is not None:
+                raise state.error
+            job, capacity, implicit, prompt_count, tools = state.info
+            rid = state.rid
+            created = int(time.time())
+            live = LiveTimings(job, prompt_count, getattr(engine, 'page_size', 256))
+            progress_log = ProgressLog(live, request_id=rid)
+            want_progress = bool(body.get('return_progress'))
+            clock = {'write': time.perf_counter(), 'timings': 0.0}
+            def event(delta, finish=None, usage=None, metrics=None, timings=None, progress=None):
+                obj = {'id': rid, 'object': 'chat.completion.chunk', 'created': created, 'model': engine.args.alias,
+                    'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
+                if usage is not None:
+                    obj['usage'] = usage
+                if timings is not None:
+                    obj['timings'] = timings
+                if progress is not None:
+                    obj['prompt_progress'] = progress
+                if metrics is not None:
+                    obj['exl3'] = metrics
+                self.wfile.write(('data: ' + json.dumps(obj, ensure_ascii=False) + '\n\n').encode('utf-8'))
+                self.wfile.flush()
+                clock['write'] = time.perf_counter()
+            if body.get('stream', False):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.close_connection = True
+                streaming = True
+                event({'role': 'assistant'}, metrics={'response_capacity': capacity})
+            parsed, output, terminal = ReasoningParser(implicit), {'content': '', 'reasoning_content': ''}, None
+            calls_parser, calls = (ToolCallParser(tools) if tools else None), []
+            def emit(pieces, final=False):
+                for key, chunk in pieces:
+                    if key == 'content' and calls_parser:
+                        sub = calls_parser.feed(chunk)
+                    else:
+                        sub = [(key, chunk)]
+                    for k, c in sub:
+                        send(k, c)
+                if final and calls_parser:
+                    for k, c in calls_parser.feed('', final=True):
+                        send(k, c)
+            def send(key, chunk):
+                if key == 'tool_call':
+                    calls.append(chunk)
+                    if streaming:
+                        event({'tool_calls': [chunk]})
+                    return
+                output[key] += chunk
+                if streaming:
+                    now = time.perf_counter()
+                    timings = None
+                    if now - clock['timings'] >= 0.2:            # 網頁即時 tok/s；約每秒 5 次
+                        clock['timings'] = now
+                        timings = live.timings()
+                    event({key: chunk}, timings=timings)
+            while not state.done.is_set() or not state.results.empty():
+                if self.disconnected():
+                    state.cancelled.set()
+                    log(speed_line(live.timings(), True, '網頁中斷連線'))
+                    return
+                if streaming and time.perf_counter() - clock['write'] >= 1.0:
+                    self.wfile.write(b': ping\n\n')              # SSE 註解：長預填期間保持連線
                     self.wfile.flush()
                     clock['write'] = time.perf_counter()
-                if body.get('stream', False):
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
-                    self.send_header('Cache-Control', 'no-cache')
-                    self.send_header('Connection', 'close')
-                    self.end_headers()
-                    self.close_connection = True
-                    streaming = True
-                    event({'role': 'assistant'}, metrics={'response_capacity': capacity})
-                engine.generator.enqueue(job)
-                parsed, output, terminal = ReasoningParser(implicit), {'content': '', 'reasoning_content': ''}, None
-                calls_parser, calls = (ToolCallParser(tools) if tools else None), []
-                def emit(pieces, final=False):
-                    for key, chunk in pieces:
-                        if key == 'content' and calls_parser:
-                            sub = calls_parser.feed(chunk)
-                        else:
-                            sub = [(key, chunk)]
-                        for k, c in sub:
-                            send(k, c)
-                    if final and calls_parser:
-                        for k, c in calls_parser.feed('', final=True):
-                            send(k, c)
-                def send(key, chunk):
-                    if key == 'tool_call':
-                        calls.append(chunk)
-                        if streaming:
-                            event({'tool_calls': [chunk]})
-                        return
-                    output[key] += chunk
-                    if streaming:
-                        now = time.perf_counter()
-                        timings = None
-                        if now - clock['timings'] >= 0.2:            # 網頁即時 tok/s；約每秒 5 次
-                            clock['timings'] = now
-                            timings = live.timings()
-                        event({key: chunk}, timings=timings)
-                while engine.generator.num_remaining_jobs():
-                    if engine.cancelled.is_set():
-                        engine.generator.cancel(job)
-                        break
-                    if select.select([self.connection], [], [], 0)[0] and self.connection.recv(1, socket.MSG_PEEK) == b'':
-                        engine.generator.cancel(job)
-                        log(speed_line(live.timings(), True, '網頁中斷連線'))
-                        return
-                    if streaming and time.perf_counter() - clock['write'] >= 1.0:
-                        self.wfile.write(b': ping\n\n')              # SSE 註解：長預填期間保持連線
-                        self.wfile.flush()
-                        clock['write'] = time.perf_counter()
-                    for result in engine.generator.iterate():
-                        stage = result.get('stage')
-                        if stage == 'prefill':
-                            progress_log.prefill(result)
-                            if streaming and want_progress:
-                                event({}, progress=live.progress(result))
-                        if stage == 'streaming':
-                            emit(parsed.feed(result.get('text', '')))
-                            progress_log.generate()
-                        if result.get('eos'):
-                            terminal = result
-                emit(parsed.feed('', final=True), final=True)
-                terminal = terminal or {}
-                usage = {'prompt_tokens': terminal.get('prompt_tokens', prompt_count),
-                    'completion_tokens': terminal.get('new_tokens', 0)}
-                usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
-                seconds = terminal.get('time_generate', 0)
-                reason = 'stop' if terminal.get('eos_reason') != 'max_new_tokens' else 'length'
-                if not terminal:
-                    reason = 'stop'
-                if calls and reason == 'stop':
-                    reason = 'tool_calls'
-                metrics = {'response_capacity': capacity, 'elapsed_seconds': time.perf_counter() - started,
-                    'generate_tps': usage['completion_tokens'] / seconds if seconds else None,
-                    'prefill_seconds': terminal.get('time_prefill'),
-                    'prefill_tps': (usage['prompt_tokens'] - (terminal.get('cached_tokens') or 0)) / terminal['time_prefill']
-                        if terminal.get('time_prefill') else None,
-                    'cached_tokens': terminal.get('cached_tokens'),
-                    'accepted_draft_tokens': terminal.get('accepted_draft_tokens'),
-                    'rejected_draft_tokens': terminal.get('rejected_draft_tokens'), 'cancelled': engine.cancelled.is_set()}
-                engine.latest = {'request_id': rid, 'usage': usage, **metrics}
-                timings = live.timings(terminal or None)
-                if streaming:
-                    event({}, reason, usage=usage, metrics=metrics, timings=timings)
-                    self.wfile.write(b'data: [DONE]\n\n')
-                    self.wfile.flush()
-                else:
-                    self.send_json(200, {'id': rid, 'object': 'chat.completion', 'created': created, 'model': engine.args.alias,
-                        'choices': [{'index': 0, 'message': {'role': 'assistant', **output,
-                            **({'tool_calls': [{k: v for k, v in c.items() if k != 'index'} for c in calls]} if calls else {})},
-                            'finish_reason': reason}],
-                        'usage': usage, 'timings': timings, 'exl3': metrics})
-                log(speed_line(timings, engine.cancelled.is_set(), '按下停止'))
+                try:
+                    result = state.results.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                stage = result.get('stage')
+                if stage == 'prefill':
+                    progress_log.prefill(result)
+                    if streaming and want_progress:
+                        event({}, progress=live.progress(result))
+                if stage == 'streaming':
+                    emit(parsed.feed(result.get('text', '')))
+                    progress_log.generate()
+                if result.get('eos'):
+                    terminal = result
+            if state.error is not None:
+                raise state.error
+            emit(parsed.feed('', final=True), final=True)
+            terminal = terminal or {}
+            usage = {'prompt_tokens': terminal.get('prompt_tokens', prompt_count),
+                'completion_tokens': terminal.get('new_tokens', live.timings()['predicted_n'])}
+            usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
+            seconds = terminal.get('time_generate', 0)
+            reason = 'stop' if terminal.get('eos_reason') != 'max_new_tokens' else 'length'
+            if not terminal:
+                reason = 'stop'
+            if calls and reason == 'stop':
+                reason = 'tool_calls'
+            metrics = {'response_capacity': capacity, 'elapsed_seconds': time.perf_counter() - started,
+                'generate_tps': usage['completion_tokens'] / seconds if seconds else None,
+                'prefill_seconds': terminal.get('time_prefill'),
+                'prefill_tps': (usage['prompt_tokens'] - (terminal.get('cached_tokens') or 0)) / terminal['time_prefill']
+                    if terminal.get('time_prefill') else None,
+                'cached_tokens': terminal.get('cached_tokens'),
+                'accepted_draft_tokens': terminal.get('accepted_draft_tokens'),
+                'rejected_draft_tokens': terminal.get('rejected_draft_tokens'), 'cancelled': state.cancelled.is_set()}
+            engine.latest = {'request_id': rid, 'usage': usage, **metrics}
+            timings = live.timings(terminal or None)
+            if streaming:
+                event({}, reason, usage=usage, metrics=metrics, timings=timings)
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            else:
+                self.send_json(200, {'id': rid, 'object': 'chat.completion', 'created': created, 'model': engine.args.alias,
+                    'choices': [{'index': 0, 'message': {'role': 'assistant', **output,
+                        **({'tool_calls': [{k: v for k, v in c.items() if k != 'index'} for c in calls]} if calls else {})},
+                        'finish_reason': reason}],
+                    'usage': usage, 'timings': timings, 'exl3': metrics})
+            log(f'[{rid}] ' + speed_line(timings, state.cancelled.is_set(), '按下停止'))
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except (ValueError, TypeError, KeyError) as exc:
@@ -975,14 +1329,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {'error': {'message': str(exc)}})
         except Exception as exc:
             traceback.print_exc()
-            if not streaming:
+            if streaming:
+                self.wfile.write(('data: ' + json.dumps({'error': {'message': str(exc)}}) + '\n\n').encode('utf-8'))
+                self.wfile.flush()
+            else:
                 self.send_json(500, {'error': {'message': str(exc)}})
         finally:
-            if job is not None:
-                with engine.torch.inference_mode():
-                    engine.generator.cancel(job)
-            engine.request_id = None
-            engine.lock.release()
+            if not state.done.is_set():
+                state.cancelled.set()
 
 
 def main():
@@ -1000,12 +1354,26 @@ def main():
     parser.add_argument('--chat-mode', default='auto')
     parser.add_argument('--thinking', choices=['on', 'off', 'auto'], default='on')
     parser.add_argument('--reasoning-effort', default=None)
+    parser.add_argument('--parallel', type=int, choices=range(1, 9), default=2,
+                        help='同時生成數（1～8）；-cs 是每路 Context，總 KV 容量為 -cs × 路數')
+    parser.add_argument('--auto-draft', action='store_true',
+                        help='依實測速度自動調草稿數（0～-ndt，0＝暫停草稿；依同時生成路數分開量）；預設關')
+    parser.add_argument('--gemv-wmma', choices=['0', '1'], default=None,
+                        help='多列快路徑（8～64 列 WMMA GEMV）；預設 1＝開')
+    parser.add_argument('--gemv-max-m', choices=['32', '64'], default=None,
+                        help='多列快路徑一次最多幾列；預設 64')
+    parser.add_argument('--dflash2-host-cb', action='store_true',
+                        help='實驗性（#490）：DFlash2 草稿的選字查表留在系統 RAM，省約 240 MB 顯存')
+    parser.add_argument('--qc-staging-sliced', action='store_true',
+                        help='實驗性（#517）：量化 KV 在注意力計算時分固定大小的段搬運')
     parser.add_argument('--vision', choices=['off', 'gpu', 'ram'], default='off',
                         help='視覺塔：off 不載入；gpu 權重放顯卡；ram 權重放系統 RAM，算圖時串流上顯卡')
     parser.add_argument('--vision-max-pixels', type=int, default=2097152,
                         help='單張圖縮到這個像素數以內（約每 1024 像素 1 個 token）；0＝用模型預設')
     args = parser.parse_args()
     args.alias = args.alias or Path(args.model_dir).name
+    if args.cache_size < 256 or args.cache_size % 256:
+        parser.error('每路 Context（-cs）必須至少 256，且為 256 的倍數')
     if not 1 <= args.port <= 65535:
         parser.error('port 必須介於 1 與 65535')
     engine = Engine(args)
@@ -1019,6 +1387,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if engine.scheduler:
+            engine.scheduler.close()
         server.server_close()
 
 
