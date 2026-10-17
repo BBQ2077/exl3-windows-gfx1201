@@ -7,14 +7,15 @@
   "triton_windows": "3.7.1.post27",
   "model_weights": "External shared model folders selected through models.json",
   "native_extensions": {
-    "exllamav3_ext.pyd": "485c29fe396c5586c3a56b2c76942aeb9480cbf10d7070f3325bb2b6001f94f6",
+    "exllamav3_ext.pyd": "80f466608e98d39b0995b92cd13065a19ade5dacdb7df50f42212228953cf7f8",
     "hip_utils.pyd": "88a529dc76e90a9876bd568bdd0df4185216eeb19ae67518f519ec5ac774adaf"
   },
-  "app_source_commit": "6b0c5515436edf2e159e18d88c3eb214d039c88d",
+  "app_source_commit": "3acdb6a9",
   "native_build": {
-    "generation": 2,
-    "artifact_bytes": 20907520,
+    "generation": 3,
+    "artifact_bytes": 22763008,
     "gpu_arch": "gfx1201",
-    "wmma_max_rows": 64
+    "wmma_max_rows": 64,
+    "wmma_tn": "1/2/4"
   }
 }

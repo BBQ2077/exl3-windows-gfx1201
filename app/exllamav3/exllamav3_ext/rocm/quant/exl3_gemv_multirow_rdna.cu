@@ -1022,6 +1022,304 @@ void exl3_gemv_wmma_dot_multi
     );
 }
 
+// =============================================================================
+// Kernel 2t: kernel 2w with TN adjacent N-tiles per block (EXL3_GEMV_WMMA_TN = 2 or 4)
+// =============================================================================
+// Kernel 2w gives each block one 16-column N-tile, so every block streams the whole rotated
+// activation slab (M x K halves) through the caches: down_proj (320 N-tiles) reads A 320 times,
+// at M = 32 about 16x the bytes of the trellis it decodes. Here a block takes TN adjacent
+// N-tiles; each wave loads its A fragments once per k-tile and runs them against the TN decoded
+// B tiles, so A traffic drops by TN. Each trellis tile is still decoded once.
+//
+// U (k-tiles per batch) is fixed by TN and M: TN x U B slots per wave, the same LDS as kernel
+// 2w at U = 4. Per output element the K order (warp chunk, U batch, WMMA) is the same for every
+// M <= 32, so rows keep the row-tile invariance of kernel 2w; results match kernel 2w to
+// rounding. The reduction scratch (WARPS x M x 16 floats) overlays the B slots after a block
+// barrier and is filled and drained once per N-tile.
+
+template <int TN, int M>
+struct Exl3WmmaTnU { static constexpr int value = (TN == 2 && M <= 32) ? 2 : 1; };
+
+// N-tiles per block for kernel 2t: 1 (off, kernel 2w), 2 or 4
+static inline int exl3_gemv_wmma_tn()
+{
+    const char* env = std::getenv("EXL3_GEMV_WMMA_TN");   // read per call: tests toggle it at runtime
+    int v = env ? atoi(env) : 1;
+    return v >= 4 ? 4 : (v >= 2 ? 2 : 1);
+}
+
+static inline size_t exl3_gemv_wmma_tn_smem_bytes(int warps, int tn, int rows)
+{
+    const int M = exl3_gemv_wmma_m(rows);
+    const int u = (tn == 2 && M <= 32) ? 2 : 1;
+    const size_t sb = (size_t) warps * tn * u * 256 * sizeof(half);
+    const size_t red = (size_t) warps * M * 16 * sizeof(float);
+    return sb > red ? sb : red;
+}
+
+// One batch of UU k-tiles from kt against the block's TN N-tiles
+template <int bits, int cb, int MT, int TN, int U, int UU>
+__device__ __forceinline__ void exl3_gemv_wmma_tn_batch
+(
+    exl3_g_char* b_c,
+    const uint32_t b_stride,
+    const uint32_t (&off)[Exl3LanePlan<bits>::R],
+    const Exl3LanePlan<bits>& lp,
+    exl3_g_char* a_g,
+    const uint32_t (&a_off)[MT],
+    const int kt,
+    half* sb,
+    const int lane,
+    const int b_off,
+    exl3_f8 (&cu)[TN][MT][U]
+)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    typedef __attribute__((address_space(1))) const uint2 exl3_g_u2;
+    constexpr int R = Exl3LanePlan<bits>::R;
+    constexpr int tile_bytes = Exl3Width<bits>::tile_bytes;
+    uint32_t raw[TN][UU][R];
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+        #pragma unroll
+        for (int u = 0; u < UU; ++u)
+            #pragma unroll
+            for (int i = 0; i < R; ++i)
+                raw[t][u][i] = exl3_ld_g(b_c + (size_t) u * b_stride + t * tile_bytes, off[i]);
+    union AV { uint2 u2[2]; exl3_h8 v; };
+    AV av[MT][UU];
+    #pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+    {
+        #pragma unroll
+        for (int u = 0; u < UU; ++u)
+        {
+            exl3_g_char* ap = a_g + (size_t) (kt + u) * 32;
+            const uint2 lo = *(exl3_g_u2*) (ap + a_off[mt]);          // k = 4h + 0..3
+            const uint2 hi = *(exl3_g_u2*) (ap + a_off[mt] + 16);     // k = 4h + 8..11
+            av[mt][u].u2[0] = make_uint2(lo.x, hi.x);                 // -> k = 4h + {0,1,8,9,2,3,10,11}
+            av[mt][u].u2[1] = make_uint2(lo.y, hi.y);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+        #pragma unroll
+        for (int u = 0; u < UU; ++u)
+        {
+            FragB f0, f1;
+            exl3_dq_tile_decode<bits, cb>(raw[t][u], lp, f0, f1);
+            union { uint4 u4; half2 h2[4]; } w;
+            w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
+            *((uint4*) (sb + (t * U + u) * 256 + lane * 8)) = w.u4;
+        }
+    __syncwarp();
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+        #pragma unroll
+        for (int u = 0; u < UU; ++u)
+        {
+            union { uint2 u2[2]; exl3_h8 v; } b;
+            b.u2[0] = *((const uint2*) (sb + (t * U + u) * 256 + b_off));
+            b.u2[1] = *((const uint2*) (sb + (t * U + u) * 256 + b_off + 8));
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                cu[t][mt][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[mt][u].v, b.v, cu[t][mt][u]);
+        }
+    __syncwarp();
+#endif
+}
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M, int TN>
+__device__ __forceinline__ void exl3_gemv_wmma_tn_body
+(
+    const half* __restrict__ A,     // this slab's rotated rows, size_k apart
+    const uint16_t* __restrict__ B, // the matrix's trellis
+    const int n_tiles,              // N-tiles of this matrix
+    const int tile_n0,              // first of the block's TN tiles
+    const int size_k,
+    void* Cb,
+    const int64_t row_off,
+    const int ldc,
+    const int size_m,
+    const half* __restrict__ svh,
+    int* seg_counters               // this slot's counters, indexed by segment
+)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    static_assert(M == 8 || M == 16 || M == 32 || M == 64, "WMMA GEMV row tile");
+    static_assert(TN == 2 || TN == 4, "WMMA GEMV N-tiles per block");
+    constexpr int U = Exl3WmmaTnU<TN, M>::value;
+    constexpr int MT = M == 8 ? 1 : M / 16;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    extern __shared__ char shared_mem[];
+    half* sb = ((half*) shared_mem) + warp_id * TN * U * 256;
+    float* sh_red = (float*) shared_mem;   // overlays the B slots, written only after a block barrier
+
+    const int num_k_tiles = size_k / 16;
+    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    const int kb0 = warp_id * chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+
+    const int h = lane >> 4;
+    const int r = lane & 15;
+    // Rows past size_m read row 0: they only land in output rows the epilogue never stores
+    uint32_t a_off[MT];
+    #pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+    {
+        const int row = 16 * mt + r;
+        a_off[mt] = (uint32_t) (((row < size_m ? row : 0) * size_k + 4 * h) * sizeof(half));
+    }
+    exl3_g_char* a_g = (exl3_g_char*) (const char*) exl3_uni_ptr(A);
+    const int b_off = 32 * (r & 7) + 4 * (r >> 3) + 16 * h;
+
+    constexpr int R = Exl3LanePlan<bits>::R;
+    constexpr int tile_bytes = Exl3Width<bits>::tile_bytes;
+    const Exl3LanePlan<bits> lp = exl3_lane_plan<bits>(lane);
+    uint32_t off[R];
+    #pragma unroll
+    for (int i = 0; i < R; ++i) off[i] = lp.off[i];
+    const uint32_t b_stride = (uint32_t) exl3_uni(n_tiles) * tile_bytes;
+    exl3_g_char* b_c = (exl3_g_char*) (const char*) exl3_uni_ptr(B)
+                       + ((size_t) exl3_uni(kb0) * exl3_uni(n_tiles) + exl3_uni(tile_n0)) * tile_bytes;
+
+    exl3_f8 cu[TN][MT][U];
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+        #pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+            #pragma unroll
+            for (int u = 0; u < U; ++u) cu[t][mt][u] = exl3_f8{};
+    int kt = exl3_uni(kb0);
+    const int kend = exl3_uni(kb1);
+    for (; kt + U <= kend; kt += U)
+    {
+        #pragma unroll
+        for (int i = 0; i < R; ++i) exl3_opaque(off[i]);
+        #pragma unroll
+        for (int mt = 0; mt < MT; ++mt) exl3_opaque(a_off[mt]);
+        exl3_gemv_wmma_tn_batch<bits, cb, MT, TN, U, U>(b_c, b_stride, off, lp, a_g, a_off, kt, sb, lane, b_off, cu);
+        b_c += (size_t) U * b_stride;
+    }
+    if constexpr (U > 1)
+    {
+        for (; kt < kend; ++kt)
+        {
+            exl3_gemv_wmma_tn_batch<bits, cb, MT, TN, U, 1>(b_c, b_stride, off, lp, a_g, a_off, kt, sb, lane, b_off, cu);
+            b_c += b_stride;
+        }
+    }
+
+    exl3_f8 c[TN][MT];
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+        #pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+        {
+            c[t][mt] = cu[t][mt][0];
+            #pragma unroll
+            for (int u = 1; u < U; ++u) c[t][mt] += cu[t][mt][u];
+        }
+
+    __syncthreads();   // every wave is done with its B slots before sh_red overlays them
+    #pragma unroll
+    for (int t = 0; t < TN; ++t)
+    {
+        // Lane (r, h) of M tile mt holds rows 16 mt + 8 h + i of column r; at M == 8 only h == 0 is real
+        if (M > 8 || lane < 16)
+        {
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sh_red[(warp_id * M + 16 * mt + 8 * h + i) * 16 + r] = c[t][mt][i];
+        }
+        __syncthreads();
+        if (warp_id == 0)
+        {
+            float acc[M];
+            #pragma unroll
+            for (int i = 0; i < M; ++i)
+            {
+                float s = 0.0f;
+                if (lane < 16)
+                {
+                    #pragma unroll
+                    for (int w = 0; w < WARPS_PER_BLOCK; ++w) s += sh_red[(w * M + i) * 16 + lane];
+                }
+                acc[i] = s;
+            }
+            exl3_gemv_fused_epilogue_mr<c_fp32, M>
+            (
+                acc, Cb, row_off, ldc, size_m, tile_n0 + t, lane, svh, seg_counters + (tile_n0 + t) / 8
+            );
+        }
+        __syncthreads();
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M, int TN>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_wmma_tn_single
+(
+    Exl3GemvMrParams* __restrict__ pb,
+    const int size_k,
+    const int size_n,
+    const int size_m
+)
+{
+    exl3_gemv_wmma_tn_body<bits, c_fp32, cb, WARPS_PER_BLOCK, M, TN>
+    (
+        pb->A_had, pb->B, size_n / 16, blockIdx.x * TN, size_k,
+        pb->C, 0, size_n, size_m, pb->svh, pb->seg_counters
+    );
+}
+
+// Multi-matrix form: blockIdx.y is the slot
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M, int TN>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_wmma_tn_multi
+(
+    Exl3GemvMrParams* __restrict__ pb,
+    const uintptr_t* __restrict__ B_list,
+    const uintptr_t* __restrict__ svh_list,
+    const half* __restrict__ A_had,
+    const int size_k,
+    const int size_n,
+    const int size_m,
+    const int bszm,
+    const int min_index,
+    const int max_index,
+    const int* __restrict__ size_n_list,
+    void* const* __restrict__ c_list
+)
+{
+    const int j = blockIdx.y;
+    const int tile_n = blockIdx.x * TN;
+    int orig_pos;
+    const int mat_index = exl3_mgemv_mat_index(pb->indices, j, bszm, min_index, max_index, &orig_pos);
+    if (mat_index < 0) return;   // block-uniform
+    const int n_j = size_n_list ? size_n_list[mat_index] : size_n;
+    if (tile_n >= n_j / 16) return;   // block-uniform; widths are multiples of 128, so all TN tiles are in range
+    exl3_gemv_wmma_tn_body<bits, c_fp32, cb, WARPS_PER_BLOCK, M, TN>
+    (
+        A_had + (int64_t) j * size_m * size_k, (const uint16_t*) B_list[mat_index], n_j / 16, tile_n, size_k,
+        c_list ? c_list[mat_index] : pb->Cm,
+        c_list ? 0 : (int64_t) j * size_m * size_n,
+        c_list ? n_j : size_n,
+        size_m, (const half*) svh_list[mat_index], pb->seg_counters + j * (size_n / 128)
+    );
+}
+
 // EXL3_GEMV_WMMA=1 opts in, but only gfx1200/gfx1201 have the kernel body (other device variants
 // trap), so eligibility is checked per device once and cached; elsewhere the fdot2 path runs
 static inline bool exl3_gemv_wmma_enabled(int device)
@@ -1236,6 +1534,38 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
         case 8: LAUNCH_WMMA_K(kernel, 8, __VA_ARGS__) break; \
     }
 
+// TN x K x codebook x warps x M dispatch for kernel 2t (K 1-4: the bitrates this path covers)
+#define LAUNCH_WMMA_TN_T(kernel, bits_val, codebook, warps_val, m_val, tn_val, ...) \
+    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, m_val, tn_val>), grid, block, smem, stream, __VA_ARGS__); \
+    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, m_val, tn_val>), grid, block, smem, stream, __VA_ARGS__);
+#define LAUNCH_WMMA_TN_M(kernel, bits_val, codebook, warps_val, m_val, ...) \
+    if (tn == 2) { LAUNCH_WMMA_TN_T(kernel, bits_val, codebook, warps_val, m_val, 2, __VA_ARGS__) } \
+    else { LAUNCH_WMMA_TN_T(kernel, bits_val, codebook, warps_val, m_val, 4, __VA_ARGS__) }
+#define LAUNCH_WMMA_TN_W(kernel, bits_val, codebook, warps_val, ...) \
+    if (size_m <= 8) { LAUNCH_WMMA_TN_M(kernel, bits_val, codebook, warps_val, 8, __VA_ARGS__) } \
+    else if (size_m <= 16) { LAUNCH_WMMA_TN_M(kernel, bits_val, codebook, warps_val, 16, __VA_ARGS__) } \
+    else if (size_m <= 32) { LAUNCH_WMMA_TN_M(kernel, bits_val, codebook, warps_val, 32, __VA_ARGS__) } \
+    else { LAUNCH_WMMA_TN_M(kernel, bits_val, codebook, warps_val, 64, __VA_ARGS__) }
+#define LAUNCH_WMMA_TN_CB(kernel, bits_val, codebook, ...) \
+    switch (warps) { \
+        case 4:  LAUNCH_WMMA_TN_W(kernel, bits_val, codebook, 4, __VA_ARGS__) break; \
+        case 8:  LAUNCH_WMMA_TN_W(kernel, bits_val, codebook, 8, __VA_ARGS__) break; \
+        case 16: LAUNCH_WMMA_TN_W(kernel, bits_val, codebook, 16, __VA_ARGS__) break; \
+    }
+#define LAUNCH_WMMA_TN_K(kernel, bits_val, ...) \
+    switch (cb) { \
+        case 0: LAUNCH_WMMA_TN_CB(kernel, bits_val, 0, __VA_ARGS__) break; \
+        case 1: LAUNCH_WMMA_TN_CB(kernel, bits_val, 1, __VA_ARGS__) break; \
+        case 2: LAUNCH_WMMA_TN_CB(kernel, bits_val, 2, __VA_ARGS__) break; \
+    }
+#define LAUNCH_WMMA_TN(kernel, ...) \
+    switch (K) { \
+        case 1: LAUNCH_WMMA_TN_K(kernel, 1, __VA_ARGS__) break; \
+        case 2: LAUNCH_WMMA_TN_K(kernel, 2, __VA_ARGS__) break; \
+        case 3: LAUNCH_WMMA_TN_K(kernel, 3, __VA_ARGS__) break; \
+        case 4: LAUNCH_WMMA_TN_K(kernel, 4, __VA_ARGS__) break; \
+    }
+
 bool exl3_gemv_multirow_try_launch
 (
     const half* A_ptr,
@@ -1294,6 +1624,15 @@ bool exl3_gemv_multirow_try_launch
         // M = 64 doubles the reduction scratch (WARPS x 64 x 16 floats); cap the wave count so the
         // B staging slots plus sh_red stay under the 64 KB workgroup limit
         if (size_m > 32 && warps > 8) warps = 8;
+        const int tn = K <= 4 ? exl3_gemv_wmma_tn() : 1;
+        if (tn > 1)
+        {
+            dim3 grid(n_tiles / tn, 1);
+            dim3 block(warps * 32);
+            size_t smem = exl3_gemv_wmma_tn_smem_bytes(warps, tn, size_m);
+            LAUNCH_WMMA_TN(exl3_gemv_wmma_tn_single, pb, size_k, size_n, size_m)
+            return true;
+        }
         dim3 grid(n_tiles, 1);
         dim3 block(warps * 32);
         const int u = size_m > 32 ? 2 : exl3_gemv_wmma_unroll();   // M = 64: keep the accumulator tile small
@@ -1399,6 +1738,16 @@ bool exl3_mgemv_multirow_try_launch
         const int n_tiles = size_n / 16;
         int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm);
         if (size_m > 32 && warps > 8) warps = 8;
+        const int tn = K <= 4 ? exl3_gemv_wmma_tn() : 1;
+        if (tn > 1)
+        {
+            dim3 grid(n_tiles / tn, bszm);
+            dim3 block(warps * 32);
+            size_t smem = exl3_gemv_wmma_tn_smem_bytes(warps, tn, size_m);
+            LAUNCH_WMMA_TN(exl3_gemv_wmma_tn_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
+                           size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list)
+            return true;
+        }
         const int u = size_m > 32 ? 2 : exl3_gemv_wmma_unroll();
         dim3 grid(n_tiles, bszm);
         dim3 block(warps * 32);
@@ -1429,6 +1778,12 @@ bool exl3_mgemv_multirow_try_launch
     return true;
 }
 
+#undef LAUNCH_WMMA_TN
+#undef LAUNCH_WMMA_TN_K
+#undef LAUNCH_WMMA_TN_CB
+#undef LAUNCH_WMMA_TN_W
+#undef LAUNCH_WMMA_TN_M
+#undef LAUNCH_WMMA_TN_T
 #undef LAUNCH_WMMA
 #undef LAUNCH_WMMA_K
 #undef LAUNCH_WMMA_CB

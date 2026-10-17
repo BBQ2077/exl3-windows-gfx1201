@@ -1,8 +1,8 @@
 {
  "format": 1,
- "version": "v2026.10.18.1",
- "created_at": "2026-10-18T00:12:42+08:00",
- "payload_bytes": 2414231822,
+ "version": "v2026.10.18.2",
+ "created_at": "2026-10-18T00:29:52+08:00",
+ "payload_bytes": 2416110266,
  "mutable_paths": [
   "models.json",
   "cache/",
@@ -2239,8 +2239,8 @@
   },
   {
    "path": "app/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu",
-   "bytes": 74146,
-   "sha256": "c16c6cbc4a715aa15cb9a5b3c18f57bab0835848fdc70514d2dd525367c4d2ca"
+   "bytes": 88731,
+   "sha256": "3cd7e5520ca794f2b781a59b3e07534b02f650c1bcd0860d8ce6db1ad48c8bd0"
   },
   {
    "path": "app/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh",
@@ -3309,8 +3309,8 @@
   },
   {
    "path": "BUILD.md",
-   "bytes": 4835,
-   "sha256": "95dc88577f03711557b85f7a2a77128d007e5e5b798c4ea65b5321f5394ea3a9"
+   "bytes": 5116,
+   "sha256": "4aa79d7817d5d1b43ff5ea6d600025a218a94c01787f081e76f05a29c974c6fe"
   },
   {
    "path": "chat-qwen38.cmd",
@@ -3449,8 +3449,8 @@
   },
   {
    "path": "native/exllamav3_ext.pyd",
-   "bytes": 20907520,
-   "sha256": "485c29fe396c5586c3a56b2c76942aeb9480cbf10d7070f3325bb2b6001f94f6"
+   "bytes": 22763008,
+   "sha256": "80f466608e98d39b0995b92cd13065a19ade5dacdb7df50f42212228953cf7f8"
   },
   {
    "path": "native/hip_utils.pyd",
@@ -3459,8 +3459,8 @@
   },
   {
    "path": "provenance.json",
-   "bytes": 765,
-   "sha256": "4d72a0d5d65f86cccf83add78d8892f86a40210842da863f0f6abedf91b0aa83"
+   "bytes": 758,
+   "sha256": "c431a5c588b87ceb2778684ffbdc5aa4e01eb623f74ea84a4f8933a2e40e7b25"
   },
   {
    "path": "python/concrt140.dll",
@@ -52839,8 +52839,8 @@
   },
   {
    "path": "README.md",
-   "bytes": 15310,
-   "sha256": "45263e2ee5df6f5b356db2eb6134cb5a03dca4680c2d65bdc4a1b90dad98e8f8"
+   "bytes": 15898,
+   "sha256": "7836585f89b653344a25c1db01088dda2c0d513bc634bff200b84852d90cc680"
   },
   {
    "path": "RESULTS.md",
@@ -52864,8 +52864,8 @@
   },
   {
    "path": "server.py",
-   "bytes": 71321,
-   "sha256": "ae1eb46b37fadcecddc347eb347a9de9cf51e2be0bd8b6155927b4bfe6b777e8"
+   "bytes": 71722,
+   "sha256": "553bbb064e65bf06bc1292f9d7214c79c82e83184bc1b979515a79a27c906d14"
   },
   {
    "path": "supported-architectures.json",
@@ -52911,6 +52911,11 @@
    "path": "tests/port/test_gemv64.py",
    "bytes": 14016,
    "sha256": "9b3897850e91bac7f731ffa62771e5ce5dca8bc128e1bf276a9db534065a5201"
+  },
+  {
+   "path": "tests/port/test_gemv_tn.py",
+   "bytes": 7108,
+   "sha256": "405ac91f11f42cfba43b63b5a7eb204aea656e130259f0b5a5f7005ca5664feb"
   },
   {
    "path": "tests/port/test_greedy_equal.py",

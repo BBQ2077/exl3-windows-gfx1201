@@ -68,6 +68,7 @@ python\python.exe -I -X utf8 -u runtime.py script tests\port\test_gemv64.py
 | `EXL3_GEMV_WMMA` | `1` | RDNA4 多列 GEMV 快路徑（8～64 列）；`0` 關閉，回到逐列 kernel |
 | `EXL3_GEMV_MAX_M` | `64` | 快路徑一次處理的最大列數；設 `32` 時 33 列以上走舊路徑 |
 | `EXL3_GEMV_WMMA_U` | 未設 | 快路徑的權重載入變體（測試用） |
+| `EXL3_GEMV_WMMA_TN` | `1` | 每個工作組一次算幾塊相鄰輸出（`1`／`2`／`4`），共用同一份輸入片段；`2`／`4` 只用於 1～4 bit 權重，`1` 與舊核心相同 |
 | `EXL3_DFLASH_SPEC` | `1` | DFlash2 草稿的拒絕取樣（保留 temperature；`0` 回到只看草稿 token） |
 | `EXL3_DFLASH_SPEC_TSCALE` | `0.5` | 上述取樣的溫度縮放 |
 | `EXL3_DFLASH2_HOST_CB` | `0` | 草稿選擇表放系統 RAM（省約 240 MB 顯存，`--dflash2-host-cb`） |

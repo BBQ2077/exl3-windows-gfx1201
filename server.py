@@ -15,6 +15,8 @@ import sys
 # RDNA4 多列 WMMA GEMV（8～64 列）：server 預設開、64 列
 os.environ['EXL3_GEMV_WMMA'] = _pre_flag('--gemv-wmma') or os.environ.get('EXL3_GEMV_WMMA', '1')
 os.environ['EXL3_GEMV_MAX_M'] = _pre_flag('--gemv-max-m') or os.environ.get('EXL3_GEMV_MAX_M', '64')
+if _pre_flag('--gemv-wmma-tn'):
+    os.environ['EXL3_GEMV_WMMA_TN'] = _pre_flag('--gemv-wmma-tn')
 if _pre_flag('--dflash2-host-cb'):
     os.environ['EXL3_DFLASH2_HOST_CB'] = '1'
 if _pre_flag('--qc-staging-sliced'):
@@ -886,7 +888,7 @@ class Engine:
                     dynamic_draft_tokens=self.args.dynamic_draft, draft_confidence=self.args.draft_confidence,
                     ngram_match_min=self.args.ngram_match_min, hybrid_draft_tokens=self.args.hybrid_draft_tokens)
                 log(f"[EXL3] 加速：多列快路徑 {'開' if os.environ.get('EXL3_GEMV_WMMA') != '0' else '關'}"
-                    f"（上限 {os.environ.get('EXL3_GEMV_MAX_M')} 列）"
+                    f"（上限 {os.environ.get('EXL3_GEMV_MAX_M')} 列，TN {os.environ.get('EXL3_GEMV_WMMA_TN', '1')}）"
                     f"｜#490 草稿查表放 RAM {'開' if os.environ.get('EXL3_DFLASH2_HOST_CB') == '1' else '關'}"
                     f"｜#517 分段搬運 {'開' if os.environ.get('EXL3_QC_STAGING_SLICED') == '1' else '關'}"
                     f"｜前文快取 RAM {self.args.cpu_cache_size or 0:g} GB"
@@ -1362,6 +1364,8 @@ def main():
                         help='多列快路徑（8～64 列 WMMA GEMV）；預設 1＝開')
     parser.add_argument('--gemv-max-m', choices=['32', '64'], default=None,
                         help='多列快路徑一次最多幾列；預設 64')
+    parser.add_argument('--gemv-wmma-tn', choices=['1', '2', '4'], default=None,
+                        help='多列快路徑每個 GPU 工作組一次算幾塊輸出（輸入共用）；1＝原做法（預設），2／4 只用於 1～4 bit 權重')
     parser.add_argument('--dflash2-host-cb', action='store_true',
                         help='實驗性（#490）：DFlash2 草稿的選字查表留在系統 RAM，省約 240 MB 顯存')
     parser.add_argument('--qc-staging-sliced', action='store_true',
