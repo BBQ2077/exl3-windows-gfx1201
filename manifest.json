@@ -1,8 +1,8 @@
 {
  "format": 1,
  "version": "v2026.10.18.2",
- "created_at": "2026-10-18T00:33:48+08:00",
- "payload_bytes": 2416110524,
+ "created_at": "2026-10-18T00:37:35+08:00",
+ "payload_bytes": 2415950361,
  "mutable_paths": [
   "models.json",
   "cache/",
@@ -3286,26 +3286,6 @@
    "path": "app/exllamav3/version.py",
    "bytes": 21,
    "sha256": "aa8ab33004758f2af1a44e0d637bbfd4d9f0003c17aa08278fb92cd9481e867f"
-  },
-  {
-   "path": "app/lilicorr.py",
-   "bytes": 7329,
-   "sha256": "302ac03a85be1f852debf69e39ce38b26a882ab0658f1806c83aedd45776af9a"
-  },
-  {
-   "path": "app/lilicorr_reference/tandem-engine-drafters-dflash2.py",
-   "bytes": 87599,
-   "sha256": "a371ec2d68005675666fe7613365f9e0b93ae5e1ac5f5e7c8fa78bf8abdcf095"
-  },
-  {
-   "path": "app/lilicorr_reference/tandem-LICENSE",
-   "bytes": 34523,
-   "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
-  },
-  {
-   "path": "app/lilicorr_reference/tandem-lilicorr.py",
-   "bytes": 30712,
-   "sha256": "b33da2ab58c0430025c3c3a4c7ddb7b3328f67d49a211b7137da09fc4e5695c9"
   },
   {
    "path": "BUILD.md",
