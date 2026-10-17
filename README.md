@@ -41,6 +41,7 @@ ExLlamaV3 的 HIP 核心是針對 `gfx1201` 預先編譯的。啟動時偵測到
 | `EXL3-gfx1201-B-app-*.zip` | 程式本體：ExLlamaV3、預編譯核心、`server.py`、網頁介面、測試 | 約 30 MB | 每次更新 |
 
 更新時通常只要下載新的 B 包覆蓋舊檔；Release 說明會註明要搭配哪一版 A 包。
+目前最新的是 B 包 `v2026.10.18.2`，A 包沿用 `v2026.10.16`。
 
 B 包的內容和本倉庫的檔案相同，所以也可以直接 `git clone` 本倉庫代替 B 包，再把 A 包解壓進 clone 下來的資料夾（`python/` 已列在 `.gitignore`）；之後用 `git pull` 更新。
 
