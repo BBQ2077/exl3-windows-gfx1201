@@ -1,8 +1,8 @@
 {
  "format": 1,
  "version": "v2026.10.18.2",
- "created_at": "2026-10-18T00:39:50+08:00",
- "payload_bytes": 2415950634,
+ "created_at": "2026-10-18T00:43:26+08:00",
+ "payload_bytes": 2416145584,
  "mutable_paths": [
   "models.json",
   "cache/",
@@ -3288,6 +3288,26 @@
    "sha256": "aa8ab33004758f2af1a44e0d637bbfd4d9f0003c17aa08278fb92cd9481e867f"
   },
   {
+   "path": "app/lilicorr.py",
+   "bytes": 7329,
+   "sha256": "302ac03a85be1f852debf69e39ce38b26a882ab0658f1806c83aedd45776af9a"
+  },
+  {
+   "path": "app/lilicorr_reference/tandem-engine-drafters-dflash2.py",
+   "bytes": 87599,
+   "sha256": "a371ec2d68005675666fe7613365f9e0b93ae5e1ac5f5e7c8fa78bf8abdcf095"
+  },
+  {
+   "path": "app/lilicorr_reference/tandem-LICENSE",
+   "bytes": 34523,
+   "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+  },
+  {
+   "path": "app/lilicorr_reference/tandem-lilicorr.py",
+   "bytes": 30712,
+   "sha256": "b33da2ab58c0430025c3c3a4c7ddb7b3328f67d49a211b7137da09fc4e5695c9"
+  },
+  {
    "path": "BUILD.md",
    "bytes": 5116,
    "sha256": "4aa79d7817d5d1b43ff5ea6d600025a218a94c01787f081e76f05a29c974c6fe"
@@ -3426,6 +3446,11 @@
    "path": "licenses/ROCm/share/doc/rocthrust/LICENSE",
    "bytes": 10351,
    "sha256": "eb3d7b5485466acbd81f2b496f595ab637d2792e268206b27d99e793bdb67549"
+  },
+  {
+   "path": "licenses/TandemLLM-AGPL-3.0.txt",
+   "bytes": 34523,
+   "sha256": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
   },
   {
    "path": "native/exllamav3_ext.pyd",
@@ -52819,8 +52844,8 @@
   },
   {
    "path": "README.md",
-   "bytes": 16429,
-   "sha256": "7bd6366baa490a24f292e5ba7f2a50ede1c96dc69c10aa8d4915e18929d47837"
+   "bytes": 16693,
+   "sha256": "cfb86691fb1f7595bd3a5351d51af1a44503b7de3190a4cddf199cb38e8361dc"
   },
   {
    "path": "RESULTS.md",

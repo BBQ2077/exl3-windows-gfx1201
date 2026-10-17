@@ -266,5 +266,6 @@ runtime 以隔離模式執行（`python -I`），不讀系統的 Python、CUDA�
 - Triton Windows：https://github.com/triton-lang/triton-windows（MIT）
 - llama.cpp WebUI：https://github.com/ggml-org/llama.cpp（MIT）
 - Python：PSF License（`python/LICENSE.txt`）
+- `app/lilicorr.py`、`app/lilicorr_reference/`：可攜式草稿模型（LiLiCorr）的張量運算與參考實作，改寫自 TandemLLM，**這兩個路徑的程式碼為 AGPL-3.0**（全文見 `licenses/TandemLLM-AGPL-3.0.txt`），其餘部分不受影響。
 
 各套件授權另見 `python/Lib/site-packages/*.dist-info`。模型權重不包含在本 runtime 內，授權依各模型頁面。
