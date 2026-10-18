@@ -26,6 +26,10 @@ tools\build\build_ext.cmd
 | torch | `2.13.0+rocm10.0.0rc4` | `https://rocm.prereleases.amd.com/whl-multi-arch/` |
 | rocm（devel） | `10.0.0rc4` | 同上 |
 
+這是**編譯環境**的版本，目前發布的 `.pyd` 就是用它編的。**執行環境**（A 包的 `python\`）是
+`torch 2.13.0+rocm10.1.0`，用上面版本編出的 `.pyd` 直接在 10.1.0 上執行，實測正常；
+所以兩邊版本號不同是正常的，不必為了一致把編譯環境改成 10.1.0。
+
 `rocm[devel]` 會把 clang、HIP 標頭與 hipBLAS 解到 `site-packages\_rocm_sdk_devel`；`build_ext.cmd`
 用它裡面的 `clang-cl.exe` 當 CXX，並設定 `PYTORCH_ROCM_ARCH=gfx1201`、`DISTUTILS_USE_SDK=1`、
 `MAX_JOBS`（預設 CPU 執行緒數）。
